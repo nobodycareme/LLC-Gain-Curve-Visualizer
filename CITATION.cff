@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software in a publication, please cite it as follows."
+title: "LLC Gain Curve Visualizer"
+version: "v1.0.0"
+date-released: "2026-08-06"
+authors:
+  - family-names: "nobodycareme"
+    given-names: ""
+    orcid: ""
+url: "https://github.com/nobodycareme/LLC-Gain-Curve-Visualizer"
+license: "MIT"
+keywords:
+  - llc-converter
+  - resonant-converter
+  - power-electronics
+  - fha
+  - gain-curve

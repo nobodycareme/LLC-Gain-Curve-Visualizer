@@ -1,0 +1,86 @@
+name: Bug Report
+description: 报告 LLC 增益曲线可视化工具的缺陷
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报告问题。请尽量提供完整信息以便复现。
+
+  - type: dropdown
+    id: version
+    attributes:
+      label: 软件版本
+      description: 你使用的是哪个版本？
+      options:
+        - v1.0.0（官方 Release）
+        - 从源码运行（main 分支）
+        - 其他（请注明）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Windows 版本
+      options:
+        - Windows 10 64 位
+        - Windows 11 64 位
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: params
+    attributes:
+      label: 参数（K, Q, fn, fr）
+      description: 出现问题时使用的参数，例如 K=5, Q=0.5, fn=1.0, fr=124.4
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 一步步描述如何触发问题
+      placeholder: "1. 启动程序\n2. 调节 Q 滑块到 8\n3. 观察右侧结果区"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 截图
+      description: 如有截图请附上（请裁剪，不要包含本地绝对路径或个人隐私信息）
+
+  - type: dropdown
+    id: official
+    attributes:
+      label: 是否使用官方 Release 下载的 EXE？
+      options:
+        - "是"
+        - "否（第三方来源，请说明）"
+        - "从源码运行"
+    validations:
+      required: true
+
+  - type: input
+    id: sha
+    attributes:
+      label: EXE SHA-256
+      description: 可选。在 PowerShell 中执行 Get-FileHash ".\LLC-Gain-Curve-Visualizer-v1.0.0-Windows-x64.exe" -Algorithm SHA256 获取

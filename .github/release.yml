@@ -1,0 +1,54 @@
+# 自动生成 Release 说明
+
+# 为 Github 自动生成的 Release 说明提供默认分类
+name-template: '$RESOLVED_VERSION'
+tag-template: 'v$RESOLVED_VERSION'
+
+categories:
+  - title: '🚀 功能'
+    labels:
+      - 'feature'
+      - 'enhancement'
+  - title: '🐛 Bug 修复'
+    labels:
+      - 'bug'
+      - 'fix'
+  - title: '📖 文档'
+    labels:
+      - 'documentation'
+      - 'docs'
+  - title: '🧪 测试'
+    labels:
+      - 'test'
+      - 'tests'
+  - title: '🔧 维护'
+    labels:
+      - 'chore'
+      - 'refactor'
+      - 'build'
+
+change-template: '- $TITLE @$AUTHOR (#$NUMBER)'
+no-changes-template: '- 无显著变动'
+
+change-title-escapes: '\<*_&`#@'
+
+version-resolver:
+  major:
+    labels:
+      - 'major'
+  minor:
+    labels:
+      - 'minor'
+  patch:
+    labels:
+      - 'patch'
+      - 'bug'
+      - 'fix'
+      - 'docs'
+      - 'test'
+      - 'chore'
+      - 'build'
+  default: patch
+
+# 始终用于最终 release notes 的模板（即使发布经过里程碑或讨论）
+prerelease: false
