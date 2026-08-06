@@ -12,6 +12,7 @@
 [![PySide6](https://img.shields.io/badge/PySide6-6.7%2B-41CD52)](requirements.txt)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/Tests-317%20passed-brightgreen.svg)](#tests-and-validation)
+[![CI](https://img.shields.io/github/actions/workflow/status/nobodycareme/LLC-Gain-Curve-Visualizer/tests.yml?label=CI)](https://github.com/nobodycareme/LLC-Gain-Curve-Visualizer/actions/workflows/tests.yml)
 [![Status](https://img.shields.io/badge/Status-Stable-brightgreen.svg)](#)
 
 An interactive Windows desktop tool for studying the **FHA (First Harmonic Approximation)

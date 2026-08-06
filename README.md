@@ -12,6 +12,7 @@
 [![PySide6](https://img.shields.io/badge/PySide6-6.7%2B-41CD52)](requirements.txt)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/Tests-317%20passed-brightgreen.svg)](#测试与验证)
+[![CI](https://img.shields.io/github/actions/workflow/status/nobodycareme/LLC-Gain-Curve-Visualizer/tests.yml?label=CI)](https://github.com/nobodycareme/LLC-Gain-Curve-Visualizer/actions/workflows/tests.yml)
 [![Status](https://img.shields.io/badge/Status-Stable-brightgreen.svg)](#)
 
 一个用于研究 LLC 谐振变换器 **FHA（基波近似）增益特性** 的交互式 Windows 桌面工具，
