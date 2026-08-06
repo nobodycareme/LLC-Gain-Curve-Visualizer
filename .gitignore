@@ -36,3 +36,5 @@ offline_wheels/
 Thumbs.db
 desktop.ini
 .DS_Store
+# ---- Release 验证下载目录 ----
+github_release_verify/
