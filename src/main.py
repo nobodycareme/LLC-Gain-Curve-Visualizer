@@ -40,6 +40,8 @@ from PySide6.QtCore import QObject, Qt, QTimer, QElapsedTimer  # noqa: E402
 from PySide6.QtGui import QFont  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
+    QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
@@ -73,8 +75,41 @@ from llc_py import (  # noqa: E402
     Q_MIN,
     format_result_text,
 )
+# ---- 工程设计数学层（Phase 2/3/4 产物，见需求 14~23） ----
+from llc_design import (  # noqa: E402
+    DesignSpec,
+    compute_design,
+    recommend_q,
+    validate_spec,
+)
+from llc_solver import solve_gain_frequency  # noqa: E402
+from llc_stress import (  # noqa: E402
+    cr_stress,
+    fha_phasor,
+    secondary_currents,
+)
+from llc_report import (  # noqa: E402
+    build_analysis,
+    build_suggestions,
+    format_design_results,
+    format_stress_results,
+)
 
 APP_TITLE = "LLC 谐振变换器交互式多增益曲线"
+
+# ---- 工程设计默认值（Phase 6） ----
+# 次级整流形式 -> 内部键（ct_diode/ct_sr/fb_diode/fb_sr）
+RECT_OPTIONS = [
+    ("Center Tap diode", "ct_diode"),
+    ("Center Tap SR", "ct_sr"),
+    ("Full Bridge diode", "fb_diode"),
+    ("Full Bridge SR", "fb_sr"),
+]
+#: 过载倍率选项（显示标签 -> 倍率）
+OVERLOAD_OPTIONS = [("100%", 1.0), ("110%", 1.1), ("120%", 1.2)]
+DEFAULT_VIN_MIN, DEFAULT_VIN_NOM, DEFAULT_VIN_MAX = 300.0, 390.0, 480.0
+DEFAULT_VO, DEFAULT_POUT, DEFAULT_IO = 12.0, 600.0, 50.0
+DEFAULT_ETA, DEFAULT_VF, DEFAULT_N = 0.92, 0.5, 16.0
 
 # 滑块使用整数刻度模拟连续/对数取值
 SLIDER_STEPS = 1000
@@ -185,12 +220,21 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.resize(1420, 860)
-        self.setMinimumSize(1040, 700)
+        self.resize(1420, 960)
+        self.setMinimumSize(1040, 820)
 
         # ---- 状态 ----
         self._updating = False          # 回调重入锁
         self._pending = False
+
+        # ---- 工程设计事务式状态（Phase 6，需求二十六） ----
+        self._engine_dirty = True       # 工程设计输入变化需要重算
+        self._engine_ok = False         # 最近一次工程设计是否有效
+        self._engine = None             # 最近有效工程设计结果 dict
+        self._stress = None             # 最近有效 FHA 应力 dict
+        self._engine_error = None       # 最近一次设计错误信息（出现则保留旧结果）
+        self._sync_io_vo = False        # Pout/Io/Vo 联动重入锁
+        self._auto_q_sync = False       # 推荐 Q 写回滑块重入锁
 
         # dirty 标志：记录哪些参数需要重新计算
         # 注意：dirty_k 表示 "K = Lm/Lr"（电感比）改变，会重算全部曲线；
@@ -360,6 +404,120 @@ class MainWindow(QMainWindow):
         panel.setMaximumHeight(170)
         root.addWidget(panel, stretch=0)
 
+        # ---------- 底部第二行：工程设计参数 + 显示选项 ----------
+        eng_row = QHBoxLayout()
+        eng_row.setSpacing(8)
+
+        # --- 工程设计参数面板（Phase 6，需求十一） ---
+        eng_panel = QGroupBox("工程设计参数（FHA estimate）")
+        eng_panel.setFont(QFont(qt_font_family() or "", 10, QFont.Bold))
+        egrid = QGridLayout(eng_panel)
+        egrid.setContentsMargins(10, 12, 10, 8)
+        egrid.setHorizontalSpacing(8)
+        egrid.setVerticalSpacing(5)
+        r = 0
+
+        def spin(dec, lo, hi, val, st=1.0, w=76):
+            sb = QDoubleSpinBox()
+            sb.setDecimals(dec)
+            sb.setRange(lo, hi)
+            sb.setValue(val)
+            sb.setSingleStep(st)
+            sb.setKeyboardTracking(False)
+            sb.setMinimumWidth(w)
+            return sb
+
+        # 行 0：Vin_min / Vin_nom / Vin_max
+        for col, (lbl, sb) in enumerate([
+            ("Vin_min/V", None), ("Vin_nom/V", None), ("Vin_max/V", None)]):
+            egrid.addWidget(QLabel(lbl), r, col * 2)
+        self.spinVinMin = spin(1, 1.0, 1e5, DEFAULT_VIN_MIN, 5.0)
+        self.spinVinNom = spin(1, 1.0, 1e5, DEFAULT_VIN_NOM, 5.0)
+        self.spinVinMax = spin(1, 1.0, 1e5, DEFAULT_VIN_MAX, 5.0)
+        for col, sb in enumerate((self.spinVinMin, self.spinVinNom, self.spinVinMax)):
+            egrid.addWidget(sb, r, col * 2 + 1)
+        r += 1
+
+        # 行 1：Vo / Pout / Io
+        egrid.addWidget(QLabel("Vo/V"), r, 0)
+        self.spinVo = spin(2, 0.1, 1e4, DEFAULT_VO, 1.0)
+        egrid.addWidget(self.spinVo, r, 1)
+        egrid.addWidget(QLabel("Pout/W"), r, 2)
+        self.spinPout = spin(1, 0.1, 1e7, DEFAULT_POUT, 10.0)
+        egrid.addWidget(self.spinPout, r, 3)
+        egrid.addWidget(QLabel("Io/A"), r, 4)
+        self.spinIo = spin(2, 0.01, 1e6, DEFAULT_IO, 1.0)
+        egrid.addWidget(self.spinIo, r, 5)
+        r += 1
+
+        # 行 2：拓扑 / 整流
+        egrid.addWidget(QLabel("拓扑"), r, 0)
+        self.comboBridge = QComboBox()
+        self.comboBridge.addItems(["Half Bridge", "Full Bridge"])
+        self.comboBridge.setCurrentIndex(0)
+        egrid.addWidget(self.comboBridge, r, 1)
+        egrid.addWidget(QLabel("次级整流"), r, 2)
+        self.comboRect = QComboBox()
+        self.comboRect.addItems([t for t, _ in RECT_OPTIONS])
+        self.comboRect.setCurrentIndex(1)   # Center Tap SR
+        egrid.addWidget(self.comboRect, r, 3, 1, 3)
+        r += 1
+
+        # 行 3：匝比 / Q 模式
+        egrid.addWidget(QLabel("匝比"), r, 0)
+        self.comboTurn = QComboBox()
+        self.comboTurn.addItems(["自动", "手动"])
+        self.comboTurn.setCurrentIndex(0)
+        egrid.addWidget(self.comboTurn, r, 1)
+        self.spinN = spin(3, 0.01, 1e4, DEFAULT_N, 0.5, 76)
+        self.spinN.setEnabled(False)
+        egrid.addWidget(self.spinN, r, 2)
+        egrid.addWidget(QLabel("Q 模式"), r, 3)
+        self.comboQMode = QComboBox()
+        self.comboQMode.addItems(["手动", "自动推荐"])
+        self.comboQMode.setCurrentIndex(0)
+        egrid.addWidget(self.comboQMode, r, 4, 1, 2)
+        r += 1
+
+        # 行 4：效率 / Vf / 过载
+        egrid.addWidget(QLabel("η"), r, 0)
+        self.spinEta = spin(3, 0.01, 1.0, DEFAULT_ETA, 0.01, 64)
+        egrid.addWidget(self.spinEta, r, 1)
+        egrid.addWidget(QLabel("Vf(V)"), r, 2)
+        self.spinVdrop = spin(3, 0.0, 5.0, DEFAULT_VF, 0.05, 64)
+        egrid.addWidget(self.spinVdrop, r, 3)
+        egrid.addWidget(QLabel("过载"), r, 4)
+        self.comboOverload = QComboBox()
+        self.comboOverload.addItems([t for t, _ in OVERLOAD_OPTIONS])
+        self.comboOverload.setCurrentIndex(1)   # 110%
+        egrid.addWidget(self.comboOverload, r, 5)
+        eng_row.addWidget(eng_panel, stretch=1)
+
+        # --- 显示选项面板（Phase 8，需求四） ---
+        disp_panel = QGroupBox("显示选项")
+        disp_panel.setFont(QFont(qt_font_family() or "", 10, QFont.Bold))
+        dbox = QVBoxLayout(disp_panel)
+        dbox.setContentsMargins(10, 10, 10, 8)
+        dbox.setSpacing(4)
+        self.cbRefQ = QCheckBox("预设参考 Q 曲线")
+        self.cbRefQ.setChecked(True)
+        self.cbBoundary = QCheckBox("阻容分界线 ∠Zin=0")
+        self.cbBoundary.setChecked(True)
+        self.cbMRange = QCheckBox("Mmin ~ Mmax 范围")
+        self.cbMRange.setChecked(False)
+        self.cbFnRange = QCheckBox("fnmin ~ fnmax 范围")
+        self.cbFnRange.setChecked(False)
+        for w in (self.cbRefQ, self.cbBoundary, self.cbMRange, self.cbFnRange):
+            dbox.addWidget(w)
+        note = QLabel("恒显：当前 Q / fnp / fnr=1 / 工作点 fn / 增益峰值",
+                      wordWrap=False)
+        note.setStyleSheet("color:#666;")
+        dbox.addWidget(note)
+        dbox.addStretch(1)
+        eng_row.addWidget(disp_panel, stretch=0)
+
+        root.addLayout(eng_row, stretch=0)
+
         # ---------- 信号 ----------
         # valueChanged 只记录最新目标参数 + 置 dirty，不直接刷新
         self.sliderK.valueChanged.connect(self._on_k_changed)
@@ -372,6 +530,25 @@ class MainWindow(QMainWindow):
         self.sliderK.sliderReleased.connect(self._on_released)
         self.sliderQ.sliderReleased.connect(self._on_released)
         self.sliderFn.sliderReleased.connect(self._on_released)
+
+        # ---------- 工程设计参数信号（Phase 6，事务式） ----------
+        for w in (self.spinVinMin, self.spinVinNom, self.spinVinMax,
+                  self.spinVo, self.spinPout, self.spinIo,
+                  self.spinN, self.spinEta, self.spinVdrop):
+            w.valueChanged.connect(self._on_eng_spin)
+        self.comboBridge.currentIndexChanged.connect(self._on_eng_changed)
+        self.comboRect.currentIndexChanged.connect(self._on_eng_changed)
+        self.comboTurn.currentIndexChanged.connect(self._on_turn_changed)
+        self.comboQMode.currentIndexChanged.connect(self._on_qmode_changed)
+        self.comboOverload.currentIndexChanged.connect(self._on_eng_changed)
+        # 匝比自动/手动：手动时启用 n 输入
+        self._apply_turn_enabled()
+
+        # ---------- 显示选项信号（Phase 8，需求四/八） ----------
+        self.cbRefQ.stateChanged.connect(self._on_display_changed)
+        self.cbBoundary.stateChanged.connect(self._on_display_changed)
+        self.cbMRange.stateChanged.connect(self._on_display_changed)
+        self.cbFnRange.stateChanged.connect(self._on_display_changed)
 
     # ------------------------------------------------------------------
     # 参数变化回调：只标记，排队由 QTimer 合并
@@ -408,6 +585,57 @@ class MainWindow(QMainWindow):
             self._dump_perf()
         self._refresh_timer.stop()
         self._do_update()
+
+    # ------------------------------------------------------------------
+    # 工程设计/显示回调（Phase 6/8）
+    # ------------------------------------------------------------------
+    def _apply_turn_enabled(self):
+        manual = self.comboTurn.currentIndex() == 1
+        self.spinN.setEnabled(manual)
+        if not manual:
+            # 自动模式：显示由设计层算出的理论匝比
+            self.spinN.setValue(self._engine["n"] if self._engine else DEFAULT_N)
+
+    def _on_eng_spin(self, *_):
+        # Pout = Vo × Io 联动（需求十一），用重入锁避免成环
+        if not self._sync_io_vo:
+            self._sync_io_vo = True
+            try:
+                s = self.sender()
+                vo = self.spinVo.value()
+                if s is self.spinPout or s is self.spinIo:
+                    pout = self.spinPout.value()
+                    io = self.spinIo.value()
+                    if s is self.spinPout:
+                        self.spinIo.setValue(pout / vo if vo > 0 else 0.0)
+                    else:
+                        self.spinPout.setValue(io * vo)
+            finally:
+                self._sync_io_vo = False
+        self._engine_dirty = True
+        self._schedule_refresh()
+
+    def _on_eng_changed(self, *_):
+        self._engine_dirty = True
+        self._schedule_refresh()
+
+    def _on_turn_changed(self, *_):
+        self._apply_turn_enabled()
+        self._engine_dirty = True
+        self._schedule_refresh()
+
+    def _on_qmode_changed(self, *_):
+        self._engine_dirty = True
+        self._schedule_refresh()
+
+    def _on_display_changed(self, *_):
+        """显示开关：只改显示状态，不触发任何无关数学重算（需求八/二十七/二十八）。"""
+        self.plot.set_display_state(
+            show_reference=self.cbRefQ.isChecked(),
+            show_boundary=self.cbBoundary.isChecked(),
+            show_m_range=self.cbMRange.isChecked() and self._engine_ok,
+            show_fn_range=self.cbFnRange.isChecked() and self._engine_ok,
+        )
 
     def _mark_all_dirty(self):
         self.dirty_k = True
@@ -512,6 +740,13 @@ class MainWindow(QMainWindow):
             compute_ms = (_time.perf_counter() - stamp) * 1000.0
             self._record_perf(k, q, fn, compute_ms)
 
+        # ---- 工程设计与应力（事务式：需求二十六；显示/数学状态分离：需求二十七） ----
+        # 只有 K/Q/fr 或工程输入变化才重算设计层，纯 fn 拖动零重算。
+        if self._engine_dirty or k or q or fr:
+            self._engine_dirty = False
+            self._recompute_engine(k_ratio, q_cur, fr_khz)
+        self._apply_eng_availability()
+
         # 数值标签
         self.labelK.setText(f"{k_ratio:.3f}")
         self.labelQ.setText(f"{q_cur:.4f}")
@@ -524,8 +759,19 @@ class MainWindow(QMainWindow):
             f"    fr={fr_khz:.3f} kHz"
         )
 
-        # 右侧结果区：只有内容变化时才更新
+        # 右侧结果区：工作点（保持原格式，零回退）+ 工程设计/应力/分析/建议
         text = format_result_text(values)
+        if self._engine_ok and self._engine and self._stress:
+            text += "\n\n" + format_design_results(self._engine)
+            text += "\n\n" + format_stress_results(self._stress)
+            text += "\n\n【分析】\n" + "\n".join(
+                "  " + flag + " " + msg
+                for flag, msg in build_analysis(self._engine, self._stress))
+            text += "\n\n【建议】\n" + "\n".join(
+                "  • " + s_ for s_ in build_suggestions(self._engine))
+        elif self._engine_error:
+            text += "\n\n⚠ 工程参数无效：{:}\n（已保留上一套有效结果，输入会标红提示）".format(
+                self._engine_error)
         if text != self._last_applied:
             self.resultBox.setPlainText(text)
             self._last_applied = text
@@ -549,6 +795,160 @@ class MainWindow(QMainWindow):
         self.dirty_fn = False
         self.dirty_fr = False
         self.dirty_ylim = False
+
+    # ------------------------------------------------------------------
+    # 工程设计事务式计算（Phase 6/7，需求二十六）
+    # ------------------------------------------------------------------
+    def _recompute_engine(self, k_ratio: float, q_cur: float, fr_khz: float) -> bool:
+        """读取全部工程输入 → 校验 → 全量计算 → 全部成功才 commit。
+
+        任一环节失败则保留上一套有效结果并把错误写入 ``_engine_error``。
+        返回本次是否计算成功并已 commit。
+        """
+        bridge = "half" if self.comboBridge.currentIndex() == 0 else "full"
+        rect = RECT_OPTIONS[self.comboRect.currentIndex()][1]
+        vin_min = float(self.spinVinMin.value())
+        vin_nom = float(self.spinVinNom.value())
+        vin_max = float(self.spinVinMax.value())
+        vo = float(self.spinVo.value())
+        pout = float(self.spinPout.value())
+        overload = OVERLOAD_OPTIONS[self.comboOverload.currentIndex()][1]
+        eta = float(self.spinEta.value())
+        vdrop = float(self.spinVdrop.value())
+        turn_mode = "manual" if self.comboTurn.currentIndex() == 1 else "auto"
+        n_manual = float(self.spinN.value())
+        auto_q = self.comboQMode.currentIndex() == 1
+        fr_hz = fr_khz * 1000.0
+
+        def _spec(q_sel):
+            return DesignSpec(
+                bridge=bridge, rect=rect,
+                vin_min=vin_min, vin_nom=vin_nom, vin_max=vin_max,
+                vo=vo, pout=pout, vdrop=vdrop, efficiency=eta,
+                overload=overload, turn_mode=turn_mode, n_manual=n_manual,
+                fr_hz=fr_hz, k=k_ratio, q_selected=q_sel,
+            )
+
+        try:
+            errs = validate_spec(_spec(q_cur))
+            if errs:
+                raise ValueError("；".join(errs))
+
+            # 第一遍：仅需 n/M_req（用于自动推荐 Q）
+            d0 = compute_design(_spec(q_cur))
+
+            q_sel = q_cur
+            if auto_q:
+                q_sel = float(min(max(
+                    recommend_q(k_ratio, d0["M_req_max"], margin=0.10),
+                    Q_MIN), Q_MAX))
+                # 推荐 Q 写回滑块（非强制，用户可手动改/切手动模式）
+                sv = _slider_from_log(q_sel, Q_MIN, Q_MAX)
+                sv = min(max(sv, 0), SLIDER_STEPS)
+                if sv != self.sliderQ.value() and not self._auto_q_sync:
+                    self._auto_q_sync = True
+                    try:
+                        self.sliderQ.blockSignals(True)
+                        self.sliderQ.setValue(sv)
+                        self.sliderQ.blockSignals(False)
+                        self.dirty_q = True       # 下一轮重画当前 Q 曲线
+                    finally:
+                        self._auto_q_sync = False
+
+            s = _spec(q_sel)
+            errs = validate_spec(s)
+            if errs:
+                raise ValueError("；".join(errs))
+            d = compute_design(s)
+
+            # fn_min（Q_overload @ M_req_max）/ fn_max（Q_full @ M_req_min）
+            sol = solve_gain_frequency(
+                k=k_ratio,
+                q_min_branch=d["Q_overload"], m_req_max=d["M_req_max"],
+                q_max_branch=d["Q_full"], m_req_min=d["M_req_min"],
+            )
+            fn_min = float(sol["fn_min"])
+            fn_max = float(sol["fn_max"])
+
+            # 最劣工况 FHA 相量：低输入 + 过载 @ fn_min、Q_overload 曲线
+            ph = fha_phasor(
+                vin_min, fn_min * fr_hz if math.isfinite(fn_min) else fr_hz,
+                d["Lr_calc"], d["Lm_calc"], d["Cr_calc"],
+                d["Re_overload"], bridge,
+            )
+            pout_ol = pout * overload
+            io_dc = pout_ol / vo if vo > 0 else 0.0
+            sec = secondary_currents(rect, ph["ioe_rms"], d["n"], io_dc)
+            crs = cr_stress(ph["ir_rms"], ph["omega"], d["Cr_calc"],
+                            vin_min, bridge)
+
+            ds_min = fn_min * fr_khz if math.isfinite(fn_min) else float("nan")
+            ds_max = fn_max * fr_khz if math.isfinite(fn_max) else float("nan")
+
+            engine = {
+                "bridge": bridge, "rect": rect,
+                "n_mode": d["n_mode"], "n": d["n"], "n_auto": d["n_auto"],
+                "efficiency": eta,
+                "vin_min": vin_min, "vin_nom": vin_nom, "vin_max": vin_max,
+                "Pout_overload": pout_ol,
+                "RL_full": d["RL_full"], "Re_full": d["Re_full"],
+                "Zr_calc": d["Zr_calc"],
+                "Lr_calc": d["Lr_calc"], "Lm_calc": d["Lm_calc"],
+                "Cr_calc": d["Cr_calc"],
+                "M_req_min": d["M_req_min"], "M_req_nom": d["M_req_nom"],
+                "M_req_max": d["M_req_max"],
+                "Q_full": d["Q_full"], "Q_overload": d["Q_overload"],
+                "Q_auto": q_sel,
+                "fn_min": fn_min, "fn_max": fn_max,
+                "fs_min": ds_min, "fs_max": ds_max,
+                "M_available": float(sol["M_boundary"]),
+                "fn_boundary": float(sol["fn_boundary"]),
+                "fn_min_feasible": bool(sol["fn_min_feasible"]),
+                "fn_max_feasible": bool(sol["fn_max_feasible"]),
+                "fn_min_reason": sol["fn_min_reason"],
+                "auto_q": auto_q,
+                "tank": {},
+                "cr": crs,
+            }
+            stress = {
+                "ioe_rms": ph["ioe_rms"],
+                "im_rms": ph["im_rms"],
+                "ir_rms": ph["ir_rms"],
+                "ir_peak": ph["ir_peak"],
+                "secondary": sec, "cr": crs,
+            }
+
+            # ---- commit（事务式：全部成功才提交） ----
+            self._engine = engine
+            self._stress = stress
+            self._engine_error = None
+            self._engine_ok = True
+            # 显示范围带只从有效结果刷新（显示/数学分离）
+            self.plot.set_display_state(
+                m_req_min=d["M_req_min"], m_req_max=d["M_req_max"],
+                fn_min=(fn_min if sol["fn_min_feasible"] else float("nan")),
+                fn_max=(fn_max if sol["fn_max_feasible"] else float("nan")),
+            )
+            # 自动匝比：把理论 n 显示到控件
+            if turn_mode != "manual":
+                target = float(d["n_auto"])
+                if abs(self.spinN.value() - target) > max(1e-4, target * 1e-4):
+                    self.spinN.blockSignals(True)
+                    self.spinN.setValue(target)
+                    self.spinN.blockSignals(False)
+            return True
+        except Exception as exc:
+            # 失败：保留上一套有效结果，仅记录错误（需求二十六）
+            self._engine_ok = False
+            self._engine_error = str(exc)
+            return False
+
+    def _apply_eng_availability(self):
+        """工程参数未完整/无效时：M 范围与 fn 范围开关灰显不可用（需求四）。"""
+        ok = self._engine_ok
+        for cb in (self.cbMRange, self.cbFnRange):
+            if cb.isEnabled() != ok:
+                cb.setEnabled(ok)
 
     def _record_perf(self, k, q, fn, ms):
         p = self._perf

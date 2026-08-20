@@ -104,6 +104,9 @@ BOUNDARY_LABEL_COLOR = "#A00098"
 FNP_COLOR = "#d62728"
 FNR_COLOR = "#1f4fd0"
 WORK_COLOR = "#6e6e6e"
+#: 工程范围带配色：M 范围用低饱和青绿，fn 范围用暖橙（均半透明，避免遮挡曲线）。
+M_BAND_COLOR = "#2e8c50"
+FN_BAND_COLOR = "#e6951e"
 
 #: Y 轴 nice-number 候选（raw_step = ymax/目标刻度数）
 _NICE_MULTS = (1.0, 2.0, 2.5, 5.0, 10.0)
@@ -230,6 +233,18 @@ class GainPlotWidget(QWidget):
         self._hover = None          # 命中的曲线信息 dict 或 None
         self._hover_rect: QRect | None = None
         self._hover_mouse = None
+
+        # ---- 显示状态（与数学状态分离，见需求二十七） ----
+        # 仅影响"画不画/图例/Hover"，绝不触发任何无关数学重算。
+        self.show_reference = True   # 预设参考 Q 曲线族
+        self.show_boundary = True    # 阻容分界线 ∠Zin=0
+        self.show_m_range = False    # M_req_min ~ M_req_max 水平范围带
+        self.show_fn_range = False   # fn_min ~ fn_max 竖直范围带
+        # 工程范围带的数值（由设计层写入；仅显示，不影响数学）
+        self.m_req_min = float("nan")
+        self.m_req_max = float("nan")
+        self.fn_min_band = float("nan")
+        self.fn_max_band = float("nan")
 
         # ---- 性能采集（env 开关，默认关闭；供回归/报告用） ----
         self._collect_perf = os.environ.get("LLC_PERF_DETAIL", "") in (
@@ -373,6 +388,54 @@ class GainPlotWidget(QWidget):
             k_ratio=k_ratio, Q=q_cur, fn_work=fn_work,
             fr_khz=fr_khz, y_max=y_max)
 
+    def set_display_state(self, *, show_reference=None, show_boundary=None,
+                          show_m_range=None, show_fn_range=None,
+                          m_req_min=None, m_req_max=None,
+                          fn_min=None, fn_max=None) -> bool:
+        """仅更新**显示状态**，绝不触发任何无关数学重算（需求八/二十七/二十八）。
+
+        切换某个显示图层（参考 Q / 阻容边界 / M 范围 / fn 范围）只重渲染基底
+        与图例条带：数据（family_y / boundary_y / fn_boundary / region 等）被原样
+        复用。``fn_boundary`` 始终继续计算（显示状态不影响数学）。
+
+        返回是否有任何显示参数实际变化。
+        """
+        changed = False
+
+        # 逐项比较并赋值
+        if show_reference is not None and bool(show_reference) != self.show_reference:
+            self.show_reference = bool(show_reference); changed = True
+        if show_boundary is not None and bool(show_boundary) != self.show_boundary:
+            self.show_boundary = bool(show_boundary); changed = True
+        if show_m_range is not None and bool(show_m_range) != self.show_m_range:
+            self.show_m_range = bool(show_m_range); changed = True
+        if show_fn_range is not None and bool(show_fn_range) != self.show_fn_range:
+            self.show_fn_range = bool(show_fn_range); changed = True
+
+        values_changed = False
+        if m_req_min is not None and float(m_req_min) != self.m_req_min:
+            self.m_req_min = float(m_req_min); values_changed = True
+        if m_req_max is not None and float(m_req_max) != self.m_req_max:
+            self.m_req_max = float(m_req_max); values_changed = True
+        if fn_min is not None and float(fn_min) != self.fn_min_band:
+            self.fn_min_band = float(fn_min); values_changed = True
+        if fn_max is not None and float(fn_max) != self.fn_max_band:
+            self.fn_max_band = float(fn_max); values_changed = True
+
+        if changed or values_changed:
+            # 只重渲染基底（family/boundary/M·fn 带）与图例，不重算数学数据
+            self._base_dirty = True
+            self._invalidate_base_only()
+            self._clear_hover_state()
+            self.update()
+        return changed or values_changed
+
+    def _invalidate_base_only(self) -> None:
+        """只作废基底 pixmap 与图例条带，保留所有数学缓存与路径（值未变）。"""
+        self._base_pixmap = None
+        self._legend_pixmap = None
+        self._legend_key = None
+
     def _invalidate_geometry(self):
         """K / 尺寸 / ymax 变化：所有路径、基底与半动态层作废。"""
         self._path_rect = None
@@ -429,17 +492,32 @@ class GainPlotWidget(QWidget):
         return list(self.boundary_x), list(self.boundary_y)
 
     def legend_entries(self) -> list:
-        """返回图例条目列表 ``[(color, width, style, text), ...]``，供测试断言。"""
+        """返回图例条目列表 ``[(color, width, style, text), ...]``，供测试断言。
+
+        与绘图/Hover 使用同一 visibility state：隐藏层不出现在图例（需求七/八/二十八）。
+        核心五项（当前 Q、fnp、fnr=1、工作点 fn、增益峰值）始终保留，禁止隐藏。
+        """
         entries = []
-        for q, col in zip(Q_FAMILY, FAMILY_COLORS):
-            entries.append((col, 1.2, Qt.SolidLine, f"Q = {q:g}"))
+        if self.show_reference:
+            for q, col in zip(Q_FAMILY, FAMILY_COLORS):
+                entries.append((col, 1.2, Qt.SolidLine, f"Q = {q:g}"))
         entries.append((CURRENT_COLOR, 2.6, Qt.SolidLine,
                         f"当前 Q 曲线：Q={self.Q:.4f}"))
-        entries.append((BOUNDARY_COLOR, 3.2, Qt.DashLine, "阻容分界线  ∠Zin = 0"))
+        if self.show_boundary:
+            entries.append((BOUNDARY_COLOR, 3.2, Qt.DashLine,
+                            "阻容分界线  ∠Zin = 0"))
         entries.append((FNP_COLOR, 1.2, Qt.SolidLine, "fnp（并联谐振）"))
         entries.append((FNR_COLOR, 1.2, Qt.SolidLine, "fnr=1（串联谐振）"))
         entries.append((CURRENT_COLOR, 1.2, Qt.SolidLine, "△ 增益峰值"))
         entries.append((WORK_COLOR, 1.2, Qt.SolidLine, "◇ 工作点 fn"))
+        if self.show_m_range and math.isfinite(self.m_req_min) \
+                and math.isfinite(self.m_req_max):
+            entries.append((M_BAND_COLOR, 1.2, Qt.SolidLine,
+                            f"M 范围  {self.m_req_min:.3f}~{self.m_req_max:.3f}"))
+        if self.show_fn_range and math.isfinite(self.fn_min_band) \
+                and math.isfinite(self.fn_max_band):
+            entries.append((FN_BAND_COLOR, 1.2, Qt.SolidLine,
+                            f"fn 范围  {self.fn_min_band:.3f}~{self.fn_max_band:.3f}"))
         return entries
 
     # ------------------------------------------------------------------
@@ -694,6 +772,8 @@ class GainPlotWidget(QWidget):
         fam, bnd = self._ensure_static_paths(r)
         self._draw_family(p, r, fam)
         self._draw_boundary(p, r, bnd)
+        self._draw_m_band(p, r)      # M 范围带（显示层）
+        self._draw_fn_band(p, r)     # fn 范围带（显示层）
         self._draw_resonance_vlines(p, r)   # fnp/fnr 竖线（随 K 变化）
         # 图例独立成条带 pixmap（见 _ensure_legend_strip），不在此层以免 Q 文本失效
 
@@ -707,6 +787,8 @@ class GainPlotWidget(QWidget):
         p.fillRect(r, QColor("white"))
 
     def _draw_family(self, p: QPainter, r: QRectF, fam) -> None:
+        if not self.show_reference:      # 隐藏层不绘制（见需求七/二十八）
+            return
         p.save()
         p.setClipRect(r)
         for path, col in zip(fam, FAMILY_COLORS):
@@ -724,6 +806,8 @@ class GainPlotWidget(QWidget):
         p.restore()
 
     def _draw_boundary(self, p: QPainter, r: QRectF, bnd) -> None:
+        if not self.show_boundary:       # 隐藏层不绘制（见需求八/二十八）
+            return
         if bnd is None or bnd.isEmpty():
             return
         p.save()
@@ -770,6 +854,58 @@ class GainPlotWidget(QWidget):
         p.drawRect(box)
         p.setPen(_hex(BOUNDARY_LABEL_COLOR))
         p.drawText(box, Qt.AlignCenter, label)
+        p.restore()
+
+    def _draw_m_band(self, p: QPainter, r: QRectF) -> None:
+        """M_req_min ~ M_req_max 水平范围带（淡色半透明，只显示不计算）。"""
+        if not self.show_m_range:
+            return
+        a, b = float(self.m_req_min), float(self.m_req_max)
+        if not (math.isfinite(a) and math.isfinite(b)):
+            return
+        lo, hi = min(a, b), max(a, b)
+        y_lo = self._map_y_full(lo, r)
+        y_hi = self._map_y_full(hi, r)
+        band = QRectF(r.left(), y_hi, r.width(), y_lo - y_hi)
+        if band.height() <= 0.0:
+            return
+        p.save()
+        p.setClipRect(r)
+        fill = QColor(M_BAND_COLOR)
+        fill.setAlpha(24)
+        p.fillRect(band, fill)
+        pen = QPen(_hex(M_BAND_COLOR), 0)
+        pen.setWidthF(0)
+        pen.setStyle(Qt.DashLine)
+        p.setPen(pen)
+        p.drawLine(band.left(), y_hi, band.right(), y_hi)
+        p.drawLine(band.left(), y_lo, band.right(), y_lo)
+        p.restore()
+
+    def _draw_fn_band(self, p: QPainter, r: QRectF) -> None:
+        """fn_min ~ fn_max 竖直范围带（淡色半透明，只显示不计算）。"""
+        if not self.show_fn_range:
+            return
+        a, b = float(self.fn_min_band), float(self.fn_max_band)
+        if not (math.isfinite(a) and math.isfinite(b)):
+            return
+        lo, hi = min(a, b), max(a, b)
+        x_lo = self._map_x(lo, r)
+        x_hi = self._map_x(hi, r)
+        band = QRectF(x_lo, r.top(), x_hi - x_lo, r.height())
+        if band.width() <= 0.0:
+            return
+        p.save()
+        p.setClipRect(r)
+        fill = QColor(FN_BAND_COLOR)
+        fill.setAlpha(24)
+        p.fillRect(band, fill)
+        pen = QPen(_hex(FN_BAND_COLOR), 0)
+        pen.setWidthF(0)
+        pen.setStyle(Qt.DashLine)
+        p.setPen(pen)
+        p.drawLine(x_lo, band.top(), x_lo, band.bottom())
+        p.drawLine(x_hi, band.top(), x_hi, band.bottom())
         p.restore()
 
     def _draw_grid(self, p: QPainter, r: QRectF) -> None:
@@ -1143,13 +1279,19 @@ class GainPlotWidget(QWidget):
         self._hover_mouse = None
 
     def _candidates(self, fn_mouse):
-        """返回候选曲线列表（每条含 kind / q / 颜色 / 曲线值函数）。"""
+        """返回候选曲线列表（每条含 kind / q / 颜色 / 曲线值函数）。
+
+        隐藏层一律不进入候选：关闭参考 Q 曲线族 / 阻容分界线后，Hover 不再命中
+        这些已隐藏曲线（与绘图、图例同一 visibility state，见需求二十八）。
+        """
         out = []
-        for q, col in zip(Q_FAMILY, FAMILY_COLORS):
-            out.append({"kind": "family", "q": float(q), "color": col})
+        if self.show_reference:
+            for q, col in zip(Q_FAMILY, FAMILY_COLORS):
+                out.append({"kind": "family", "q": float(q), "color": col})
         out.append({"kind": "current", "q": float(self.Q),
                     "color": CURRENT_COLOR})
-        out.append({"kind": "boundary", "q": None, "color": BOUNDARY_COLOR})
+        if self.show_boundary:
+            out.append({"kind": "boundary", "q": None, "color": BOUNDARY_COLOR})
         return out
 
     def _curve_m_at(self, kind, q, fn_mouse):
