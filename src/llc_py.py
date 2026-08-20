@@ -89,13 +89,19 @@ def _gain_scalar(fn2: float, fn2m1: float, fn: float, k: float, q: float) -> flo
 
 
 def llc_gain(fn, k_ratio: float, q: float):
-    """等价于 :func:`llc_model.llc_gain`，标量返回 float，序列返回 list。"""
+    """等价于 :func:`llc_model.llc_gain`，标量返回 float，序列返回 list。
+
+    高频极限说明：对固定的 ``Q > 0``，当 ``fn → ∞`` 时 ``M → 0``；
+    ``M → K/(1+K)`` 仅是 ``Q = 0``（空载）的特殊极限，不得将二者混淆。
+    本函数对 ``k_ratio`` / ``q`` 一律先 ``float(...)`` 强转（标量与序列路径一致，
+    即使入参为字符串也可安全解析）。
+    """
     k = float(k_ratio)
     qq = float(q)
     n = _seq(fn)
     if n is None:
         return _gain_scalar(
-            float(fn) ** 2, float(fn) ** 2 - 1.0, float(fn), k, q
+            float(fn) ** 2, float(fn) ** 2 - 1.0, float(fn), k, qq
         )
     fn2 = [f * f for f in fn]
     return [
@@ -126,20 +132,31 @@ def fn_series() -> float:
 
 
 def make_fn_curve(n: int = N_CURVE_POINTS) -> list:
-    lo, hi = math.log10(FN_MIN), math.log10(FN_MAX)
     n = int(n)
+    if n < 2:  # 至少 2 点，避免 (n-1) 作为分母为零
+        raise ValueError(f"n 必须 >= 2，当前为 {n}")
+    lo, hi = math.log10(FN_MIN), math.log10(FN_MAX)
     return [10.0 ** (lo + (hi - lo) * (i / (n - 1))) for i in range(n)]
 
 
 def find_peak(fn_curve, m_curve) -> tuple[float, float]:
-    """有限值上取最大值；无有限值返回 ``(nan, nan)``。"""
+    """有限值上取最大值；无有限值返回 ``(nan, nan)``。
+
+    使用 ``math.isfinite`` 同时排除 NaN 与 ±Inf（Inf 会通过 ``m == m`` 检查，
+    故不能只用它判断）。
+    """
     best = None
     peak_fn = peak_m = float("nan")
     for f, m in zip(fn_curve, m_curve):
-        if m == m and m is not None:  # 简单 isfinite 检查
-            if best is None or m > best:
-                best = m
-                peak_fn, peak_m = float(f), float(m)
+        try:
+            fv = float(f)
+            mv = float(m)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(mv):
+            if best is None or mv > best:
+                best = mv
+                peak_fn, peak_m = fv, mv
     if best is None:
         return float("nan"), float("nan")
     return peak_fn, peak_m

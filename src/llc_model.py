@@ -97,6 +97,10 @@ GAIN_CLIP: float = 1.0e6
 def llc_gain(fn, k_ratio: float, q: float):
     """计算 LLC FHA 增益 ``M(fn, K, Q)``。
 
+    高频极限说明：对固定的 ``Q > 0``，当 ``fn → ∞`` 时 ``M → 0``；
+    ``M → K/(1+K)`` 仅是 ``Q = 0``（空载）的特殊极限（仅在分母中 Q 项
+    完全消失时成立），不得将二者混淆。
+
     参数
     ----
     fn : float 或 array_like
@@ -176,7 +180,10 @@ def fn_series() -> float:
 
 def make_fn_curve(n: int = N_CURVE_POINTS) -> np.ndarray:
     """生成对数分布的归一化频率扫描向量（等价于 ``logspace(-1, 1, n)``）。"""
-    return np.logspace(np.log10(FN_MIN), np.log10(FN_MAX), int(n))
+    n = int(n)
+    if n < 2:  # 至少 2 点，避免 (n-1) 作为分母为零
+        raise ValueError(f"n 必须 >= 2，当前为 {n}")
+    return np.logspace(np.log10(FN_MIN), np.log10(FN_MAX), n)
 
 
 def find_peak(fn_curve: np.ndarray, m_curve: np.ndarray) -> tuple[float, float]:
