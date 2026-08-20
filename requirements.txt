@@ -1,31 +1,30 @@
 # LLC 增益曲线 —— 运行与构建依赖
 #
-# 版本说明：
-#   下列版本区间中的具体版本已在本项目实际验证通过
-#   （验证环境：Python 3.10 64 位，numpy 2.2.6 / matplotlib 3.10.9 /
-#     PySide6-Essentials 6.9.1 / PyInstaller 6.21.0 / pytest 9.1.1，
-#     317 个单元测试全部通过，onedir 打包程序启动成功）。
+# 运行依赖（最终 EXE 只携带这些）
+#   PySide6-Essentials：QtCore/QtGui/QtWidgets 已含，且不含 QtWebEngine/
+#     Quick3D 等重模块，可显著减小 EXE。
 #
-#   这里使用 ">=,<" 的兼容区间而不是死锁单一版本，原因是：
-#   Windows + Python 3.11 下 numpy / matplotlib 的可用轮子版本
-#   可能与验证环境略有差异；锁死反而会导致 pip 无法安装。
-#   如需完全复现，可解除注释下方"严格锁定"部分。
+# 数学层与绘图层为纯 Python（src/llc_py.py + src/plot_widget.py），
+# 不 import numpy / matplotlib，因此打包 EXE 无需携带这两个库。
 
+PySide6-Essentials>=6.7,<7.0
+pyinstaller>=6.10,<7.0
+
+# ---------------------------------------------------------------
+# 开发 / 测试依赖（仅源码运行测试时需要，不进入最终 EXE）
+# ---------------------------------------------------------------
+# pytest: 单元测试
+# numpy + matplotlib: 仅支撑旧的矢量参考实现(llc_model.py/llc_plot.py)与
+#   llc_py ↔ llc_model 数值一致性交叉测试；打包运行时已完全剥离。
+pytest>=8.0,<10.0
 numpy>=2.0,<3.0
 matplotlib>=3.8,<4.0
 
-# 使用 PySide6-Essentials 而非完整 PySide6：
-# 体积显著更小，且已包含本程序所需的 QtCore/QtGui/QtWidgets。
-PySide6-Essentials>=6.7,<7.0
-
-pyinstaller>=6.10,<7.0
-pytest>=8.0,<10.0
-
 # ---------------------------------------------------------------
-# 严格锁定（可选）：如需与验证环境完全一致，注释掉上面并启用下面
+# 严格锁定（可选）：如需与当前验证环境完全一致，请取消注释
 # ---------------------------------------------------------------
-# numpy==2.2.6
-# matplotlib==3.10.9
-# PySide6-Essentials==6.9.1
+# PySide6-Essentials==6.11.1
 # pyinstaller==6.21.0
 # pytest==9.1.1
+# numpy==2.2.6
+# matplotlib==3.10.9

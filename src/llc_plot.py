@@ -34,9 +34,12 @@ from llc_model import (
     FN_MAX,
     FN_MIN,
     Q_FAMILY,
+    boundary_frequency,
+    boundary_gain,
     find_peak,
     fn_parallel,
     fn_series,
+    input_region,
     llc_gain,
     llc_gain_from_parts,
     make_fn_curve,
@@ -93,6 +96,19 @@ class GainPlot:
             label="当前 Q 曲线",
         )
 
+        # --- 阻容分界线（∠Zin = 0，解析边界 Mb(fn)，仅依赖 K=Lm/Lr） ---
+        # 边界从 fnp = 1/sqrt(1+K)（此时 Mb→+∞）延伸到 fn→1−。
+        # 用相对容差避开奇点处的 inf，超出 ylim 的部分由绘图后端直接裁剪，
+        # 不修改数学模型。详见 llc_model.boundary_gain / q_boundary_for_fn。
+        fm0 = fn_parallel(DEFAULT_K)
+        fb_grid = np.linspace(fm0 * (1.0 + 1e-6), 1.0 - 1e-6, 420)
+        (self.hBoundary,) = ax.plot(
+            fb_grid, boundary_gain(fb_grid, DEFAULT_K),
+            color="darkslategray", linestyle=(0, (7, 4)), linewidth=2.0,
+            alpha=0.85, zorder=2.6, label="阻容分界线  ∠Zin = 0",
+        )
+        self._boundary_grid = fb_grid
+
         # --- 三条竖线（只创建一次，后续改 xdata） ---
         self.hFnpLine = ax.axvline(
             fn_parallel(DEFAULT_K), color="tab:red",
@@ -148,11 +164,11 @@ class GainPlot:
         )
 
         self._legend_handles = [
-            *self.hFamily, self.hCurrent,
+            *self.hFamily, self.hCurrent, self.hBoundary,
             self.hFnpPoint, self.hFnrPoint, self.hPeakPoint, self.hWorkPoint,
         ]
         # ---- 统计计数器（供回归测试断言，不影响性能） ----
-        self.stats = {"family": 0, "current": 0, "peak": 0, "legend": 0}
+        self.stats = {"family": 0, "current": 0, "peak": 0, "legend": 0, "boundary": 0}
         self.legend = None
         self._make_legend()
         # 图例中"当前 Q 曲线"对应的文本对象（hFamily 之后的第 1 项）
@@ -162,6 +178,10 @@ class GainPlot:
 
         # ---- 内部状态缓存 ----
         self._peak = (float("nan"), float("nan"))
+        # 工作区域（∠Zin 判据）与固定 K、Q 下的边界交点
+        self._region = "inductive"
+        self._fn_boundary = float("nan")
+        self._mboundary = float("nan")
 
     # ------------------------------------------------------------------
     def _make_legend(self) -> None:
@@ -194,6 +214,13 @@ class GainPlot:
             )
         self.stats["family"] += 1
 
+    def _compute_boundary(self, k_ratio: float) -> None:
+        """重新计算阻容分界线（仅 K=Lm/Lr 改变时需要；边界不依赖 Q）。"""
+        fm0 = fn_parallel(k_ratio)
+        fb_grid = np.linspace(fm0 * (1.0 + 1e-6), 1.0 - 1e-6, 420)
+        self.hBoundary.set_data(fb_grid, boundary_gain(fb_grid, k_ratio))
+        self.stats["boundary"] += 1
+
     def _compute_current(self, k_ratio: float, q: float) -> np.ndarray:
         """重新计算当前 Q 黑色曲线并搜索峰值。返回当前曲线 y 数据。"""
         M_cur = llc_gain_from_parts(self.fn_curve, self.fn2, self.fn2m1, k_ratio, q)
@@ -208,11 +235,19 @@ class GainPlot:
         self.ax.set_ylim(0.0, y_max)
 
     def _update_work_point(self, k_ratio: float, q: float, fn_work: float) -> float:
-        """只移动当前工作点竖线与标记（fn 改变时的轻量更新）。返回 M(fn)。"""
+        """只移动当前工作点竖线与标记（fn 改变时的轻量更新）。返回 M(fn)。
+
+        同时依据 Im(Zin) 的符号判定工作区域，并计算该 K、Q 下增益曲线
+        与阻容边界的交点频率。区域判据见 :func:`llc_model.input_region`。
+        """
         Mwork = float(llc_gain(fn_work, k_ratio, q))
         self.hWorkLine.set_xdata([fn_work, fn_work])
         self.hWorkPoint.set_data([fn_work], [Mwork])
         self.txtWork.set_x(fn_work)
+        self._region = input_region(fn_work, k_ratio, q)
+        fb = boundary_frequency(k_ratio, q)
+        self._fn_boundary = fb
+        self._mboundary = float(llc_gain(fb, k_ratio, q))
         return Mwork
 
     def _update_resonance_points(self, k_ratio: float, q: float) -> tuple:
@@ -244,6 +279,9 @@ class GainPlot:
             "fnp": fnp, "Mfnp": Mp, "fnr": fnr, "Mfnr": Mr,
             "fn_peak": fn_peak, "Mpeak": m_peak, "fr_khz": fr_khz,
             "ymax": y_max,
+            "region": self._region,
+            "fn_boundary": self._fn_boundary,
+            "M_boundary": self._mboundary,
         }
 
     # ------------------------------------------------------------------
@@ -267,8 +305,9 @@ class GainPlot:
         返回与 :meth:`update` 相同的关键数值字典。
         """
         if k:
-            # 只要 K=Lm/Lr 变了，固定族、当前曲线、谐振点、峰值、工作点全都要
+            # 只要 K=Lm/Lr 变了，固定族、当前曲线、边界、谐振点、峰值、工作点全都要
             self._compute_family(k_ratio)
+            self._compute_boundary(k_ratio)
             self._compute_current(k_ratio, Q)
             self._update_peak_point()
             fnp, Mp, fnr, Mr = self._update_resonance_points(k_ratio, Q)
@@ -312,6 +351,10 @@ class GainPlot:
         Mp = float(llc_gain(fnp, k_ratio, Q))
         Mr = float(llc_gain(fnr, k_ratio, Q))
         Mwork = float(llc_gain(fn_work, k_ratio, Q))
+        self._region = input_region(fn_work, k_ratio, Q)
+        fb = boundary_frequency(k_ratio, Q)
+        self._fn_boundary = fb
+        self._mboundary = float(llc_gain(fb, k_ratio, Q))
         return self._collect_values(
             k_ratio, Q, fn_work, fnp, Mp, fnr, Mr, Mwork, fr_khz, y_max)
 
@@ -349,6 +392,12 @@ def format_result_text(v: dict) -> str:
     fs_khz = v["fn"] * fr_khz
     fpeak_khz = fn_peak * fr_khz if np.isfinite(fn_peak) else float("nan")
 
+    region_label = {
+        "inductive": "感性区（∠Zin > 0）",
+        "capacitive": "容性区（∠Zin < 0）",
+        "boundary": "阻容边界（∠Zin ≈ 0）",
+    }.get(v["region"], v["region"])
+
     return "\n".join([
         "【当前可调参数】",
         f"  K    = {v['K']:.5f}",
@@ -356,6 +405,11 @@ def format_result_text(v: dict) -> str:
         f"  fn   = {v['fn']:.5f}",
         f"  M(fn)= {v['Mfn']:.5f}",
         f"  fs   = {fs_khz:.3f} kHz",
+        "",
+        "【工作区域】",
+        f"  当前 fn 所在：{region_label}",
+        f"  边界判定 fn_boundary = {v['fn_boundary']:.5f} (∠Zin=0)",
+        f"  M(fn_boundary)      = {v['M_boundary']:.5f}",
         "",
         "【两个自然谐振频率点】",
         f"  并联谐振：fnp  = {v['fnp']:.5f}",

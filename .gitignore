@@ -24,6 +24,7 @@ BUILD_REPORT.md
 *.log
 *.tmp
 *.bak
+*_审查包_*.zip
 
 # ---- 离线 wheel 仓库（体积大，按需生成） ----
 offline_wheels/

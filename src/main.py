@@ -30,20 +30,13 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
-# ---------------------------------------------------------------------------
-# 必须在导入 pyplot / backend 之前指定后端与字体
-# ---------------------------------------------------------------------------
-import matplotlib
-
-matplotlib.use("QtAgg")
-
-import numpy as np  # noqa: E402
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg  # noqa: E402
-from matplotlib.figure import Figure  # noqa: E402
-from PySide6.QtCore import Qt, QTimer, QElapsedTimer  # noqa: E402
+# 同步导入顺序：PlotWidget / 数学层均为纯 Python（无 numpy / matplotlib），
+# 显著降低冷启动与最终体积。
+from PySide6.QtCore import QObject, Qt, QTimer, QElapsedTimer  # noqa: E402
 from PySide6.QtGui import QFont  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
@@ -64,9 +57,9 @@ from PySide6.QtWidgets import (  # noqa: E402
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cjk_font import configure_matplotlib_chinese, qt_font_family  # noqa: E402
-from llc_plot import GainPlot, format_result_text  # noqa: E402
-from llc_model import (  # noqa: E402
+from cjk_font import qt_font_family  # noqa: E402
+from plot_widget import GainPlotWidget  # noqa: E402
+from llc_py import (  # noqa: E402
     DEFAULT_FN,
     DEFAULT_FR_KHZ,
     DEFAULT_K,
@@ -78,6 +71,7 @@ from llc_model import (  # noqa: E402
     K_MIN,
     Q_MAX,
     Q_MIN,
+    format_result_text,
 )
 
 APP_TITLE = "LLC 谐振变换器交互式多增益曲线"
@@ -90,6 +84,74 @@ REFRESH_MS = 16
 
 #: 环境变量或命令行开关：开启性能日志（默认关闭）
 PERF_LOG_ENV = "LLC_PERF_LOG"
+
+#: 启动性能测量：设 LLC_TIMING=1 后，记录 T0..T5 时间戳并自动退出。
+#: 仅在 LLC_TIMING 下启用；正常启动零开销（不写文件/不建 timer/不产生 UI）。
+TIMING_ENV = "LLC_TIMING"
+_TIMING_ENABLED: bool = os.environ.get(TIMING_ENV, "") in ("1", "true", "on")
+_TIMING_FILE: str = os.environ.get(
+    "LLC_TIMING_FILE", "llc_timing.json"
+).strip()
+_TIMING: dict[str, float] = {}
+_TIMING_START: float = 0.0
+
+
+def _timing_mark(name: str) -> None:
+    """记录一次命名时间戳（相对进程首次调用 _timing_start 的时刻，秒）。"""
+    global _TIMING_START
+    if _TIMING_START <= 0.0:
+        import time as _t
+
+        _TIMING_START = _t.perf_counter()
+    import time as _t
+
+    _TIMING[name] = _t.perf_counter() - _TIMING_START
+
+
+def _timing_finish() -> None:
+    """定时模式收尾：写入 JSON 后从事件循环退出，供外部脚本解析。"""
+    app = QApplication.instance()
+    _timing_mark("t5_cleanup")
+    try:
+        import json
+
+        with open(_TIMING_FILE, "w", encoding="utf-8") as fh:
+            json.dump(_TIMING, fh, indent=2)
+    except OSError:
+        pass
+    if app is not None:
+        app.exit(0)
+
+
+class _ReadyMarker(QObject):
+    """等待首个真实 paint 事件落地，再让事件循环兜一圈，才算"可交互"。
+
+    只有 LLC_TIMING=1 时才会安装此事件过滤器，正常启动完全不参与。
+    """
+
+    def __init__(self, app, settle_ms: int = 120):
+        super().__init__(app)
+        self._app = app
+        self._settle_ms = settle_ms
+        self._painted = False
+
+    def install(self, widget) -> None:
+        widget.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        from PySide6.QtCore import QEvent
+
+        if event.type() == QEvent.Paint and not self._painted:
+            self._painted = True
+            _timing_mark("t4_first_paint")
+            # 首帧已提交：再让事件循环兜一次，确保能响应输入/重绘
+            QTimer.singleShot(0, self._on_settle)
+        return False
+
+    def _on_settle(self) -> None:
+        _timing_mark("t5_event_loop_ready")
+        self._app.removeEventFilter(self)
+        QTimer.singleShot(self._settle_ms, _timing_finish)
 
 
 def _perf_log_enabled() -> bool:
@@ -108,17 +170,17 @@ def _slider_from_lin(value: float, lo: float, hi: float) -> int:
 
 def _log_from_slider(value: int, lo: float, hi: float) -> float:
     """整数滑块 -> 对数实数（lo/hi 为实际值，非对数）。"""
-    lg = np.log10(lo) + (np.log10(hi) - np.log10(lo)) * (value / SLIDER_STEPS)
+    lg = math.log10(lo) + (math.log10(hi) - math.log10(lo)) * (value / SLIDER_STEPS)
     return float(10.0 ** lg)
 
 
 def _slider_from_log(value: float, lo: float, hi: float) -> int:
-    frac = (np.log10(value) - np.log10(lo)) / (np.log10(hi) - np.log10(lo))
+    frac = (math.log10(value) - math.log10(lo)) / (math.log10(hi) - math.log10(lo))
     return int(round(frac * SLIDER_STEPS))
 
 
 class MainWindow(QMainWindow):
-    """主窗口：顶部标题/状态栏 + 左侧 Matplotlib 画布 + 右侧结果框 + 底部参数面板。"""
+    """主窗口：顶部标题/状态栏 + 左侧 QPainter 增益画布 + 右侧结果框 + 底部参数面板。"""
 
     def __init__(self) -> None:
         super().__init__()
@@ -161,9 +223,9 @@ class MainWindow(QMainWindow):
             self._elapsed.start()
 
         self._build_ui()
-        # 全部图形对象只在此创建一次（由 llc_plot.GainPlot 统一管理）
-        self.plot = GainPlot(self.figure)
-        self.ax = self.plot.ax
+        # 绘图控件：全图形对象由其内部只创建一次，增量刷新不增长
+        self.plot = self.canvas
+        self.ax = self.canvas
 
         # 初始全量刷新（refresh 会更新标题、曲线、结果）
         self._mark_all_dirty()
@@ -199,8 +261,7 @@ class MainWindow(QMainWindow):
         upper = QHBoxLayout()
         upper.setSpacing(8)
 
-        self.figure = Figure(figsize=(9.6, 5.2), dpi=100)
-        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas = GainPlotWidget()
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.setMinimumWidth(560)
         self.canvas.setMinimumHeight(420)
@@ -336,10 +397,15 @@ class MainWindow(QMainWindow):
         self._schedule_refresh()
 
     def _on_released(self, *_):
-        """滑块释放：立即做一次全量高精度刷新，确保落在最终值。"""
+        """滑块释放：只冲刷尚未 flush 的最后一个值，不做全量 dirty 重算。
+
+        拖动期间 valueChanged 已把最新目标参数写入各自 dirty flag；若最后一个
+        valueChanged 还未被合并计时器 flush，这里补一次；若已 flush，则各 dirty
+        均为 False，执行一次极轻量的纯文本/元数据刷新即可。绝不在这里全量重算
+        曲线族，避免"松手顿一下"。
+        """
         if self._perf_log and self._perf:
             self._dump_perf()
-        self._mark_all_dirty()
         self._refresh_timer.stop()
         self._do_update()
 
@@ -400,14 +466,14 @@ class MainWindow(QMainWindow):
 
         try:
             fr_khz = float(self.editFr.value())
-            if not np.isfinite(fr_khz) or fr_khz <= 0:
+            if not math.isfinite(fr_khz) or fr_khz <= 0:
                 raise ValueError
         except (TypeError, ValueError):
             fr_khz = DEFAULT_FR_KHZ
 
         try:
             y_max = float(self.editYmax.value())
-            if not np.isfinite(y_max) or y_max <= 0:
+            if not math.isfinite(y_max) or y_max <= 0:
                 raise ValueError
         except (TypeError, ValueError):
             y_max = DEFAULT_YMAX
@@ -470,7 +536,7 @@ class MainWindow(QMainWindow):
             import time as _time
             draw_stamp = _time.perf_counter()
 
-        self.canvas.draw_idle()
+        self.canvas.update()
 
         if self._perf_log:
             import time as _time
@@ -515,17 +581,29 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
-    configure_matplotlib_chinese(verbose=False)
-
     app = QApplication.instance() or QApplication(sys.argv)
+    _timing_mark("t1_qapp")
     family = qt_font_family()
     if family:
         app.setFont(QFont(family, 9))
 
     win = MainWindow()
+    _timing_mark("t2_mainwin")
     win.show()
+    _timing_mark("t3_show")
+
+    if _TIMING_ENABLED:
+        # 定时模式：等“首个真实 paint 落地 + 事件循环再兜一圈”才真正算可交互，
+        # 再由 t5_event_loop_ready 之后的 settle 延迟触发自动退出。
+        _marker = _ReadyMarker(app)
+        _marker.install(win.canvas)
+        app.installEventFilter(_marker)
+
     return app.exec()
 
 
 if __name__ == "__main__":
+    if _TIMING_ENABLED:
+        _timing_mark("t0_entry")
+
     sys.exit(main())

@@ -11,36 +11,32 @@
 
 设计说明
 --------
-* 只排除确定无关的大型包（PySide6 的 WebEngine/3D/多媒体等），
+* 运行路径为 main -> plot_widget -> llc_py -> cjk_font(qt_font_family)。
+  全链路为纯 Python + PySide6-Essentials，**不 import numpy/matplotlib**，
+  因此不再收集二者的 data/hidden-import。
+* 只排除与运行无关的大型组件（Qt 的重型模块 / 开发工具 / 其他 GUI 框架），
   不盲目堆叠 hidden-import。
-* Matplotlib 只保留 Agg / QtAgg 后端，其余后端排除以减小体积。
-* Qt 平台插件由 PyInstaller 的 PySide6 hook 自动收集，无需手工指定。
+* Qt 平台插件由 PyInstaller 的 PySide6 hook 自动收集。
 """
 
 import os
-
-from PyInstaller.utils.hooks import collect_data_files
 
 BUILD_MODE = os.environ.get("LLC_BUILD_MODE", "onefile").strip().lower()
 APP_NAME = "LLC增益曲线"
 
 block_cipher = None
 
-# Matplotlib 的字体/样式数据文件必须打进去，否则运行时报缺少 mpl-data
-datas = collect_data_files("matplotlib", subdir="mpl-data")
-
-# 仅声明 PyInstaller 静态分析可能漏掉的后端模块
-hiddenimports = [
-    "matplotlib.backends.backend_qtagg",
-    "matplotlib.backends.backend_agg",
-]
+# 纯 Qt + 纯 Python 绘图，无 matplotlib data / numpy / scipy
+datas = []
+hiddenimports = []
 
 # 明确排除与本程序无关的大型组件，显著减小 EXE 体积
 excludes = [
     # 其他 GUI 工具包
     "tkinter", "PyQt5", "PyQt6", "PySide2", "wx",
-    # 科学计算栈中本程序未使用的部分
-    "scipy", "pandas", "sympy", "IPython", "jupyter", "notebook",
+    # 科学计算栈（运行路径不含 numpy / matplotlib，一并排除）
+    "numpy", "matplotlib", "scipy", "pandas", "sympy",
+    "IPython", "jupyter", "notebook",
     "pytest", "setuptools", "pip", "wheel",
     # PySide6 中未使用的重型模块
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
@@ -55,12 +51,8 @@ excludes = [
     "PySide6.QtHelp", "PySide6.QtSerialPort", "PySide6.QtSpatialAudio",
     "PySide6.QtRemoteObjects", "PySide6.QtScxml", "PySide6.QtSensors",
     "PySide6.QtTextToSpeech", "PySide6.QtPdf", "PySide6.QtPdfWidgets",
-    # Matplotlib 未使用的后端
-    "matplotlib.backends.backend_webagg",
-    "matplotlib.backends.backend_webagg_core",
-    "matplotlib.backends.backend_gtk3", "matplotlib.backends.backend_gtk4",
-    "matplotlib.backends.backend_tkagg", "matplotlib.backends.backend_wx",
-    "matplotlib.backends.backend_wxagg",
+    # 本程序仅用 QtCore/QtGui/QtWidgets，QtNetwork 为无关传递依赖，排除
+    "PySide6.QtNetwork",
 ]
 
 a = Analysis(
@@ -78,6 +70,17 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+# 剔除 Qt 软件 OpenGL 回退库。本程序纯 QPainter 栅格绘制，从不触发
+# OpenGL 上下文，此 20MB 库为无关依赖。按文件名定向剔除（不手工删 DLL，
+# 而是让构建流程确定地排除；若未来某平台需要，移除该过滤即可恢复）。
+a.binaries = [b for b in a.binaries
+              if os.path.basename(b[0]).lower() not in {
+                  "opengl32sw.dll",
+                  "libEGL.dll",
+                  "libGLESv2.dll",
+                  "d3dcompiler_47.dll",
+              }]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

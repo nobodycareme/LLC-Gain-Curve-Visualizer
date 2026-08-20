@@ -1,0 +1,1403 @@
+# -*- coding: utf-8 -*-
+"""轻量级 LLC 增益曲线绘图控件（PySide6 QWidget + QPainter，无 Matplotlib/NumPy）。
+
+设计目标
+--------
+* 完全不 import ``matplotlib`` / ``numpy``，从而大幅缩小 EXE、加快冷启动；
+* 纯 Python 数学层 :mod:`llc_py` 完成全部 LLC 计算；
+* 复刻 :mod:`llc_plot` 的**全部可见功能**：参考 Q 曲线族、当前 Q 曲线、
+  阻容分界线（∠Zin=0）、fnp/fnr/工作点竖线与标记、增益峰值、log 横轴、
+  线性纵轴、网格、**自适应图例**、中文标签、尺寸自适应、High-DPI、导出 PNG；
+* 保持与 :class:`llc_plot.GainPlot` 相同的**增量刷新契约**（``refresh``/``update``，
+  dirty flag 增量），以便 :mod:`main` 可直接切换而无需改交互逻辑。
+
+实时交互性能（分层缓存架构）
+----------------------------
+绘图分成三层：
+
+* **Layer A（Static / 基底）**：背景、坐标轴、刻度、主/次网格、参考 Q 曲线族、
+  阻容分界线、fnp/fnr 竖线与标记、峰值标记、图例。渲染进一张 ``QPixmap``，
+  只有在 **K / plot 尺寸 / ymax / Q** 真正变化时才重建。
+* **Layer B（Semi-Dynamic / 当前 Q）**：当前 Q 曲线 + 峰值，缓存为 ``QPainterPath``；
+  Q 变化时只重建这一条路径并贴回基底，不动参考族/边界。
+* **Layer C（Dynamic Overlay）**：当前 fn 竖线、工作点、工作点文字、Hover 高亮点
+  与 Tooltip。每帧绘制，极其轻量。
+
+* **QPainterPath 缓存**：所有曲线都已固化为 ``QPainterPath``，paintEvent 只
+  重放缓存路径，绝不逐点重建。
+* **fn 变化**：只更新 Overlay（工作点 + fn 竖线），零路径重建。
+* **Q 变化**：只重建当前 Q 一条路径，零参考族/边界重建。
+* **K 变化**：重建参考族 + 边界 + 当前 Q 路径。
+* **滑块释放**：不再全量 dirty，只刷新尚未 flush 的最后一个值（见 :mod:`main`）。
+
+曲线裁剪
+--------
+采用 ``painter.setClipRect(plot_rect)`` 原生裁剪：曲线超过 ymax 的部分由 Qt
+裁掉，**不会通过修改数据造成"断线"**。
+
+Hover Inspector
+---------------
+鼠标悬停任意增益曲线即显示精确 LLC 参数。命中检测使用**数学公式直接计算**
+（每条候选曲线只算 1 个标量点），不做 3000 采样点遍历。行为：
+* 反变换 ``pixel_to_fn`` 与正变换 ``fn_to_pixel`` 互为一致；
+* 候选 = 9 条参考 Q + 当前 Q + 阻容分界线，按屏幕像素距离选最近；
+* 距离几乎相同（< 1px）时 tie-break：当前 Q > 阻容分界线 > 参考 Q；
+* 容差 8 CSS 像素（逻辑坐标，天然兼容 High-DPI）；
+* 区域判据来自 ``input_region``（∠Zin），不从图形两侧猜测。
+
+对象/缓存不增长
+--------------
+数据数组只在构造函数中分配一次；``refresh`` 只改写已有列表元素，绝不 append
+到长期数组、绝不新增绘制对象。缓存路径/基底 pixmap 均原地替换，数量恒定。
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QEvent  # noqa: F401
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+)
+from PySide6.QtWidgets import QWidget
+
+# 引入纯 Python 数学层（无 numpy / matplotlib）
+from llc_py import (  # noqa: E402
+    DEFAULT_FN,
+    DEFAULT_K,
+    DEFAULT_YMAX,
+    FN_MAX,
+    FN_MIN,
+    Q_FAMILY,
+    boundary_frequency,
+    boundary_gain,
+    find_peak,
+    fn_parallel,
+    fn_series,
+    input_region,
+    llc_gain,
+    llc_gain_from_parts,
+    make_fn_curve,
+    q_boundary_for_fn,
+)
+
+__all__ = ["GainPlotWidget", "FAMILY_COLORS"]
+
+#: 参考 Q 曲线族配色（近似 tab10，前 9 色）
+FAMILY_COLORS = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22",
+]
+CURRENT_COLOR = "#111111"
+#: 阻容分界线：高饱和品红，白底高对比，明显区别于黑当前 Q / 红 fnp / 蓝 fnr。
+BOUNDARY_COLOR = "#D000C8"
+BOUNDARY_LABEL_COLOR = "#A00098"
+FNP_COLOR = "#d62728"
+FNR_COLOR = "#1f4fd0"
+WORK_COLOR = "#6e6e6e"
+
+#: Y 轴 nice-number 候选（raw_step = ymax/目标刻度数）
+_NICE_MULTS = (1.0, 2.0, 2.5, 5.0, 10.0)
+
+#: Hover 命中容差（CSS/逻辑像素，天然兼容 High-DPI）
+HOVER_TOL_PX = 8.0
+#: 多曲线几乎重合（< 1px 差）时的优先级：数值越小越优先
+_HOVER_PRIORITY = {"current": 0, "boundary": 1, "family": 2}
+
+
+def _hex(color: str) -> QColor:
+    return QColor(color)
+
+
+def _fmt_bound_val(x: float) -> str:
+    """边界量（可能 ±inf/NaN）的展示格式"""
+    if x is None:
+        return "—"
+    x = float(x)
+    if math.isnan(x):
+        return "无定义"
+    if math.isinf(x):
+        return "∞"
+    return f"{x:.4f}"
+
+
+def _fmt_freq(hz: float) -> str:
+    """频率自动 Hz / kHz / MHz 显示"""
+    if hz is None or math.isnan(hz) or math.isinf(hz):
+        return "∞"
+    if hz >= 1.0e6:
+        return f"{hz / 1.0e6:.3f} MHz"
+    if hz >= 1.0e3:
+        return f"{hz / 1.0e3:.3f} kHz"
+    return f"{hz:.1f} Hz"
+
+
+_REGION_LABEL = {
+    "inductive": "感性区（∠Zin > 0）",
+    "capacitive": "容性区（∠Zin < 0）",
+    "boundary": "阻容边界（∠Zin ≈ 0）",
+}
+
+
+class GainPlotWidget(QWidget):
+    """QPainter 版增益曲线控件。
+
+    ``stats`` 与 :class:`llc_plot.GainPlot` 语义一致：记录各类计算次数，
+    供回归测试断言"增量更新正确性"。
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setMinimumSize(560, 420)
+        self.setMouseTracking(True)
+
+        # ---- 数学数据：只在构造时分配一次 ----
+        self.fn_curve = make_fn_curve()
+        self.fn2 = [f * f for f in self.fn_curve]
+        self.fn2m1 = [f2 - 1.0 for f2 in self.fn2]
+        n = len(self.fn_curve)
+        nan = float("nan")
+
+        self.family_y = [[nan] * n for _ in Q_FAMILY]
+        self.current_y = [nan] * n
+        self.boundary_x: list = []
+        self.boundary_y: list = []
+
+        # ---- 逐参数缓存 ----
+        self.K = float(DEFAULT_K)
+        self.Q = 0.5
+        self.fn_work = float(DEFAULT_FN)
+        self.fr_khz = 124.4
+        self.ymax = float(DEFAULT_YMAX)
+
+        self.peak = (float("nan"), float("nan"))
+        self.region = "inductive"
+        self.fn_boundary = float("nan")
+        self.mboundary = float("nan")
+
+        # fnp/fnr 竖线与工作点
+        self.fnp = fn_parallel(self.K)
+        self.fnr = fn_series()
+
+        self.stats = {"family": 0, "current": 0, "peak": 0, "boundary": 0}
+
+        # ---- Layer 缓存（路径 / 基底 pixmap / 重建计数） ----
+        self._base_pixmap: QPixmap | None = None
+        self._base_dirty = True
+        self._base_key_size = (-1, -1)
+        self._base_key_dpr = 0.0
+
+        #: 真正不随 K 变化的背景层（白底+网格+坐标轴+刻度文字）独立 pixmap。
+        #: K 拖动时基底只合成这张缓存 + K 依赖曲线，省去重画网格/文字。
+        self._backdrop_pixmap: QPixmap | None = None
+        self._backdrop_key = (-1, -1, None)
+
+        # 路径缓存（含其构建键，判断是否需要重建）
+        self._fam_paths: list = []
+        self._boundary_path: QPainterPath | None = None
+        self._cur_path: QPainterPath | None = None
+        self._path_rect: QRectF | None = None
+        self._path_keys = {"K": None, "Q": None}
+
+        #: Layer B（当前 Q 曲线 + fnp/fnr/峰值 marker）独立 pixmap。
+        #: 只随 Q/K/尺寸/字号变化重建；fn 拖动完全复用，从 repaint 中省掉重画
+        #: 当前曲线的 1500 点 drawPath 成本。
+        self._semi_pixmap: QPixmap | None = None
+        self._semi_key = None
+
+        #: 各层重建次数（供回归测试断言"只重建必要层"）
+        self.rebuild = {
+            "family_path": 0, "boundary_path": 0,
+            "current_path": 0, "base": 0,
+        }
+
+        #: fn_curve 显示采样点（索引 + 像素 X）缓存：同一 rect 下所有 fn_curve
+        #: 路径共享，K/Q 变化时无需逐点重算 log10 映射。
+        self._disp_idx: list = []
+        self._disp_px: list = []
+        self._disp_key = None
+
+        # ---- Hover 状态 ----
+        self._hover = None          # 命中的曲线信息 dict 或 None
+        self._hover_rect: QRect | None = None
+        self._hover_mouse = None
+
+        # ---- 性能采集（env 开关，默认关闭；供回归/报告用） ----
+        self._collect_perf = os.environ.get("LLC_PERF_DETAIL", "") in (
+            "1", "true", "on")
+        self._paint_ms: list = []
+        self._hover_ms: list = []
+        import time as _t
+        self._time = _t
+
+        # -- 初始数据（等价一次全量刷新） --
+        self._compute_family(self.K)
+        self._compute_boundary(self.K)
+        self._compute_current(self.K, self.Q)
+        self._update_region()
+
+    # ------------------------------------------------------------------
+    # 数学计算（只改列表元素，不增长）
+    # ------------------------------------------------------------------
+    def _compute_family(self, k_ratio: float) -> None:
+        for y, q in zip(self.family_y, Q_FAMILY):
+            new = llc_gain_from_parts(self.fn_curve, self.fn2, self.fn2m1, k_ratio, q)
+            y[:] = [float(v) for v in new]
+        self.stats["family"] += 1
+        self.rebuild["family_path"] += 1  # 数据变了，路径需重建
+        self._base_dirty = True
+
+    def _compute_current(self, k_ratio: float, q: float) -> None:
+        new = llc_gain_from_parts(self.fn_curve, self.fn2, self.fn2m1, k_ratio, q)
+        self.current_y[:] = [float(v) for v in new]
+        self.peak = find_peak(self.fn_curve, self.current_y)
+        self.stats["current"] += 1
+        self.stats["peak"] += 1
+        self.rebuild["current_path"] += 1  # 数据变了，路径需重建
+        # 基底 pixmap 不依赖 Q：Q 是否触发基底重建由调用方决定（K 路径置位，Q 路径不置位）
+
+    def _compute_boundary(self, k_ratio: float) -> None:
+        fm0 = fn_parallel(k_ratio)
+        step = (1.0 - fm0) / 419
+        xs = [fm0 * (1.0 + 1e-6) + step * i for i in range(420)]
+        xs[-1] = 1.0 - 1e-6
+        ys = boundary_gain(xs, k_ratio)
+        if not self.boundary_x:
+            self.boundary_x = [float(v) for v in xs]
+            self.boundary_y = [float(v) for v in ys]
+        else:
+            self.boundary_x[:] = [float(v) for v in xs]
+            self.boundary_y[:] = [float(v) for v in ys]
+        self.stats["boundary"] += 1
+        self.rebuild["boundary_path"] += 1  # 数据变了，路径需重建
+        self._base_dirty = True
+
+    def _update_region(self) -> None:
+        self.region = input_region(self.fn_work, self.K, self.Q)
+        fb = boundary_frequency(self.K, self.Q)
+        self.fn_boundary = fb
+        self.mboundary = float(llc_gain(fb, self.K, self.Q))
+
+    # ------------------------------------------------------------------
+    # 增量刷新接口（与 llc_plot.GainPlot.refresh 契约一致）
+    # ------------------------------------------------------------------
+    def refresh(self, k: bool = False, q: bool = False, fn: bool = False,
+                fr: bool = False, ylim: bool = False,
+                k_ratio: float = DEFAULT_K, Q: float = 0.5,
+                fn_work: float = DEFAULT_FN, fr_khz: float = 124.4,
+                y_max: float = DEFAULT_YMAX) -> dict:
+        # 任何参数变化都会让旧 hover 失效
+        if k or q or fn or fr or ylim:
+            self._clear_hover_state()
+
+        was_ylim = self.ymax
+        if k:
+            self.K = float(k_ratio)
+            self.Q = float(Q)
+            self.fn_work = float(fn_work)
+            self.fr_khz = float(fr_khz)
+            if ylim:
+                self.ymax = float(y_max)
+            self.fnp = fn_parallel(self.K)
+            self.fnr = fn_series()
+            self._compute_family(self.K)
+            self._compute_boundary(self.K)
+            self._compute_current(self.K, self.Q)
+            self._update_region()
+            if was_ylim != self.ymax or ylim:
+                self._base_dirty = True
+            self._invalidate_geometry()
+            self.update()
+            return self._values()
+
+        if q:
+            self.K = float(k_ratio)
+            self.Q = float(Q)
+            self.fn_work = float(fn_work)
+            self.fr_khz = float(fr_khz)
+            if ylim:
+                self.ymax = float(y_max)
+            self.fnp = fn_parallel(self.K)
+            self.fnr = fn_series()
+            self._compute_current(self.K, self.Q)
+            self._update_region()
+            if was_ylim != self.ymax:
+                self._base_dirty = True
+            self._invalidate_current_geometry()
+            self.update()
+            return self._values()
+
+        if fn:
+            self.K = float(k_ratio)
+            self.Q = float(Q)
+            self.fn_work = float(fn_work)
+            self.fr_khz = float(fr_khz)
+            if ylim:
+                self.ymax = float(y_max)
+            self.fnp = fn_parallel(self.K)
+            self.fnr = fn_series()
+            self._update_region()
+            if was_ylim != self.ymax:
+                self._base_dirty = True
+            self.update()
+            return self._values()
+
+        # fr / ylim / 纯文本更新：只更新元数据与显示范围
+        self.K = float(k_ratio)
+        self.Q = float(Q)
+        self.fn_work = float(fn_work)
+        self.fr_khz = float(fr_khz)
+        if ylim:
+            self.ymax = float(y_max)
+        self.fnp = fn_parallel(self.K)
+        self.fnr = fn_series()
+        self._update_region()
+        if was_ylim != self.ymax:
+            self._base_dirty = True
+        self.update()
+        return self._values()
+
+    def update_full(self, k_ratio, q_cur, fn_work, fr_khz, y_max) -> dict:
+        """全量刷新（兼容旧调用方）。"""
+        return self.refresh(
+            k=True, q=True, fn=True, fr=True, ylim=True,
+            k_ratio=k_ratio, Q=q_cur, fn_work=fn_work,
+            fr_khz=fr_khz, y_max=y_max)
+
+    def _invalidate_geometry(self):
+        """K / 尺寸 / ymax 变化：所有路径、基底与半动态层作废。"""
+        self._path_rect = None
+        self._path_keys = {"K": None, "Q": None}
+        self._fam_paths = []
+        self._boundary_path = None
+        self._cur_path = None
+        self._base_key_size = (-1, -1)
+        self._base_dirty = True
+        self._base_pixmap = None
+        self._semi_pixmap = None
+        self._semi_key = None
+        self.rebuild["base"] += 1
+
+    def _invalidate_current_geometry(self):
+        """仅 Q 变化：只作废当前 Q 路径与半动态层，绝不动基底 pixmap。
+
+        基底内容（backdrop 网格 + 参考族/边界/fnp·fnr 竖线）全部与 Q 无关，Q 变化
+        必须复用原地缓存 base，从而把单帧成本压到"重算当前曲线 + 重放半动态层"，
+        消除 Q 拖动卡顿。当前 Q 曲线/标记属于 Layer B，Q 变化重建 semi pixmap
+        覆盖到 base 之上，无像素残留。
+        """
+        if self._path_rect is not None:
+            self._path_keys["Q"] = None
+            self._cur_path = None
+        self._semi_pixmap = None
+        self._semi_key = None
+
+    def _values(self) -> dict:
+        return {
+            "K": self.K, "Q": self.Q, "fn": self.fn_work,
+            "Mfn": float(llc_gain(self.fn_work, self.K, self.Q)),
+            "fnp": fn_parallel(self.K),
+            "Mfnp": float(llc_gain(fn_parallel(self.K), self.K, self.Q)),
+            "fnr": fn_series(),
+            "Mfnr": float(llc_gain(fn_series(), self.K, self.Q)),
+            "fn_peak": self.peak[0], "Mpeak": self.peak[1],
+            "fr_khz": self.fr_khz, "ymax": self.ymax,
+            "region": self.region,
+            "fn_boundary": self.fn_boundary,
+            "M_boundary": self.mboundary,
+        }
+
+    # ------------------------------------------------------------------
+    # 测试辅助（读取当前内存数据）
+    # ------------------------------------------------------------------
+    def current_data_y(self) -> list:
+        return list(self.current_y)
+
+    def family_data_y(self) -> list:
+        return [list(y) for y in self.family_y]
+
+    def boundary_data(self) -> tuple:
+        return list(self.boundary_x), list(self.boundary_y)
+
+    def legend_entries(self) -> list:
+        """返回图例条目列表 ``[(color, width, style, text), ...]``，供测试断言。"""
+        entries = []
+        for q, col in zip(Q_FAMILY, FAMILY_COLORS):
+            entries.append((col, 1.2, Qt.SolidLine, f"Q = {q:g}"))
+        entries.append((CURRENT_COLOR, 2.6, Qt.SolidLine,
+                        f"当前 Q 曲线：Q={self.Q:.4f}"))
+        entries.append((BOUNDARY_COLOR, 3.2, Qt.DashLine, "阻容分界线  ∠Zin = 0"))
+        entries.append((FNP_COLOR, 1.2, Qt.SolidLine, "fnp（并联谐振）"))
+        entries.append((FNR_COLOR, 1.2, Qt.SolidLine, "fnr=1（串联谐振）"))
+        entries.append((CURRENT_COLOR, 1.2, Qt.SolidLine, "△ 增益峰值"))
+        entries.append((WORK_COLOR, 1.2, Qt.SolidLine, "◇ 工作点 fn"))
+        return entries
+
+    # ------------------------------------------------------------------
+    # 坐标映射（正/反变换互为一致）
+    # ------------------------------------------------------------------
+    def _map_x(self, fn: float, r: QRectF) -> float:
+        log = math.log10(fn)
+        lo = math.log10(FN_MIN)
+        span = math.log10(FN_MAX) - lo
+        return r.left() + (log - lo) / span * r.width()
+
+    def pixel_to_fn(self, x: float, r: QRectF) -> float:
+        """像素 X -> fn（``_map_x`` 严格反函数）。"""
+        if r.width() <= 0.0:
+            return float("nan")
+        lo = math.log10(FN_MIN)
+        span = math.log10(FN_MAX) - lo
+        frac = (x - r.left()) / r.width()
+        return float(10.0 ** (lo + frac * span))
+
+    def _map_y(self, m: float, r: QRectF, ymax: float = None) -> float:
+        """绘图用映射：夹取到 [0, ymax]，工作点/标记落在图内边缘。"""
+        top = float(self.ymax if ymax is None else ymax)
+        return r.top() + (top - max(0.0, min(m, top))) / top * r.height()
+
+    def _map_y_full(self, m: float, r: QRectF, ymax: float = None) -> float:
+        """命中检测用映射：不夹取（保留真实几何，供像素距离计算）。"""
+        top = float(self.ymax if ymax is None else ymax)
+        if top <= 0.0:
+            return r.top()
+        return r.top() + (top - float(m)) / top * r.height()
+
+    # ------------------------------------------------------------------
+    # 图例自适应布局
+    # ------------------------------------------------------------------
+    def _legend_font(self, h: float) -> QFont:
+        f = QFont(self.font() or QFont())
+        f.setPointSizeF(max(7.0, h / 120.0))
+        return f
+
+    def _legend_layout(self, avail_w, widget_h):
+        """根据可用宽度动态决定图例列数/行数/行高/每列宽。
+
+        返回 dict：{cols, rows, row_h, col_w, entries, height}
+        """
+        entries = self.legend_entries()
+        font = self._legend_font(widget_h)
+        met = QFontMetrics(font)
+        pad_x, pad_y = 10, 4
+        swatch = 16
+        gap = swatch + 10
+
+        widths = [met.horizontalAdvance(txt) for (_, _, _, txt) in entries]
+        longest = max(widths)
+        n = len(entries)
+        avail = max(80.0, avail_w - pad_x * 2)
+        cols = max(1, min(n, int(avail / (longest + gap))))
+        rows = max(1, math.ceil(n / cols))
+        # 行高随设备缩放适当放大，避免 High-DPI 文字烫行
+        dpr = self.devicePixelRatioF()
+        row_h = met.height() + max(pad_y, int(2 * max(1.0, dpr)))
+        height = rows * row_h + pad_y
+        return {
+            "cols": cols, "rows": rows, "row_h": row_h, "col_w": widths,
+            "entries": entries, "height": height, "font": font,
+        }
+
+    def _plot_rect(self, w: float, h: float) -> QRectF:
+        """绘图区（顶部留出独立图例 band 防止遮挡核心曲线）。"""
+        left = 74.0
+        right = 26.0
+        bottom = 46.0
+        avail_w = max(80.0, w - left - right)
+        legend = self._legend_layout(avail_w, float(h))
+        top = legend["height"] + 8.0
+        return QRectF(left, top, avail_w, max(20.0, float(h) - top - bottom))
+
+    # ------------------------------------------------------------------
+    # 曲线路径构建（一次构建，供基底渲染与 PNG 复用）
+    # ------------------------------------------------------------------
+    def _render_step(self, total: int) -> int:
+        """显示采样步长：把 N 个数据点降采样为约 1600 个显示点。
+
+        数学精度（峰值/边界/Hover）始终用精确公式，显示采样减少不会影响结果。
+        数据数组本身仍保留 3000 点，仅用于路径构建时步进。
+        """
+        target = 1600
+        if total <= target:
+            return 1
+        return max(1, math.ceil(total / target))
+
+    def _display_sample(self, r: QRectF, step: int):
+        """fn_curve 显示采样点缓存：返回 (索引列表, 像素 X 列表)。
+
+        同一 rect + step 下，fn_curve 上所有曲线（家族/当前）的像素 X 完全一致，
+        只算一次。``step=1``（边界用 boundary_x 走各自路径）除外。
+        """
+        key = (r.left(), r.top(), r.width(), r.height(), step)
+        if self._disp_idx and self._disp_key == key:
+            return self._disp_idx, self._disp_px
+        lo = math.log10(FN_MIN)
+        span = math.log10(FN_MAX) - lo
+        idx: list = []
+        px: list = []
+        n = len(self.fn_curve)
+        cs = max(1, step)
+        for i in range(0, n, cs):
+            fn = self.fn_curve[i]
+            idx.append(i)
+            px.append(r.left() + (math.log10(fn) - lo) / span * r.width())
+        self._disp_idx = idx
+        self._disp_px = px
+        self._disp_key = key
+        return idx, px
+
+    def _build_curve_path(self, xs, ys, r: QRectF, step: int = 1,
+                          disp: tuple | None = None) -> QPainterPath:
+        path = QPainterPath()
+        started = False
+        big = max(40.0, r.height() * 6.0)
+        clamp0 = r.top() - big
+        clamp1 = r.bottom() + big
+        n = len(xs)
+        cs = max(1, step)
+        if disp is not None:
+            # 使用共享的 (索引, 像素X) —— 避免逐点 log10 重算
+            d_idx, d_px = disp
+            top = float(self.ymax)
+            for i, px in zip(d_idx, d_px):
+                m = ys[i]
+                if m is None or m != m:  # NaN：断开
+                    started = False
+                    continue
+                py = r.top() + (top - float(m)) / top * r.height()
+                if py < clamp0 or py > clamp1:
+                    py = clamp0 if py < clamp0 else clamp1
+                if not started:
+                    path.moveTo(px, py)
+                    started = True
+                else:
+                    path.lineTo(px, py)
+            return path
+        for i in range(0, n, cs):
+            fn = xs[i]
+            m = ys[i]
+            if m is None or m != m:  # NaN：断开
+                started = False
+                continue
+            try:
+                px = self._map_x(fn, r)
+                py = self._map_y_full(m, r)
+            except (ValueError, OverflowError):
+                started = False
+                continue
+            if py < clamp0 or py > clamp1:  # 把远离可视区的巨值夹紧，保持路径有效
+                py = clamp0 if py < clamp0 else clamp1
+            if not started:
+                path.moveTo(px, py)
+                started = True
+            else:
+                path.lineTo(px, py)
+        return path
+
+    def _ensure_static_paths(self, r: QRectF):
+        """Layer A 路径：参考族 + 阻容边界（按 K + rect 缓存；Q 不触发重建）。"""
+        key = (self.K, r.left(), r.top(), r.width(), r.height())
+        if self._path_rect != r or self._path_keys["K"] != key:
+            step = self._render_step(len(self.fn_curve))
+            disp = self._display_sample(r, step)
+            self._fam_paths = [self._build_curve_path(self.fn_curve, y, r, step, disp)
+                               for y in self.family_y]
+            self._boundary_path = self._build_curve_path(
+                self.boundary_x, self.boundary_y, r, 1)
+            self._path_keys["K"] = key
+            self._path_rect = r
+        if self._cur_path is None:
+            step = self._render_step(len(self.fn_curve))
+            disp = self._display_sample(r, step)
+            self._cur_path = self._build_curve_path(
+                self.fn_curve, self.current_y, r, step, disp)
+            self._path_keys["Q"] = (self.Q, self.K)
+        return self._fam_paths, self._boundary_path
+
+    def _ensure_current_path(self, r: QRectF) -> QPainterPath:
+        """Layer B 路径：当前 Q 曲线（按 Q+K+rect 缓存，Q 变化时只重建它）。"""
+        if self._path_keys["Q"] != (self.Q, self.K):
+            step = self._render_step(len(self.fn_curve))
+            disp = self._display_sample(r, step)
+            self._cur_path = self._build_curve_path(
+                self.fn_curve, self.current_y, r, step, disp)
+            self._path_keys["Q"] = (self.Q, self.K)
+        return self._cur_path
+
+    # ------------------------------------------------------------------
+    # 基底（Layer A + B）渲染
+    # ------------------------------------------------------------------
+    def _y_ticks(self):
+        """基于 ymax 的 nice ticks（步长取 1/2/2.5/5 × 10^n）。
+
+        刻度从 0 递增到"首个 ≥ ymax 的步长整数倍"，保证顶部刻度即为规整值
+        （如 ymax=2.2 → 0,0.5,...,2.5），绝不出现 2.2 这类非 nice 顶值。
+        """
+        ymax = max(0.01, float(self.ymax))
+        target = 6.0
+        raw = ymax / target
+        if raw <= 0.0 or not math.isfinite(raw):
+            return [0.0, ymax]
+        exp = math.floor(math.log10(raw))
+        base = 10.0 ** exp
+        step = None
+        for mult in _NICE_MULTS:
+            cand = mult * base
+            if cand <= 0.0:
+                continue
+            if (ymax / cand) <= 7.5:
+                step = cand
+                break
+        if step is None:
+            step = 10.0 * base
+        if step <= 0.0:
+            step = ymax / 6.0
+        limit = math.ceil(ymax / step) * step  # 首个 ≥ ymax 的步长整数倍
+        ticks = [round(v, 10) for v in
+                 (limit * (i / max(1, int(round(limit / step))))
+                  for i in range(int(round(limit / step)) + 1))]
+        if not ticks or ticks[-1] < ymax:
+            ticks.append(round(ymax, 10))
+        return ticks
+
+    def _minor_log_freqs(self):
+        """log 横轴次网格：每个 decade 统一 2..9 × 10^n，再筛到当前范围。"""
+        out = []
+        for dec in range(-6, 7):  # 覆盖 1e-6..1e6，再筛
+            e = dec
+            for m in (2, 3, 4, 5, 6, 7, 8, 9):
+                v = m * (10.0 ** e)
+                if FN_MIN <= v <= FN_MAX:
+                    out.append(v)
+        return out
+
+    def _draw_scene_static(self, p: QPainter, r: QRectF) -> None:
+        """Layer A：静息基底（背景/网格/坐标轴/图例 + 参考族 + 边界 + fnp/fnr 竖线）。
+
+        此层缓存在 ``_base_pixmap``，只有 K / plot 尺寸 / ymax / theme 变化才重建。
+        ``_ensure_backdrop`` 提供不随 K 变化的网格/坐标轴/刻度文字并优先合成，
+        K 依赖内容（参考族/边界/谐振竖线）此处仅重绘。
+        """
+        bd = self._ensure_backdrop()
+        if bd is not None:
+            p.drawPixmap(0, 0, bd)
+        # 网格已画入 backdrop；这里补画 K 依赖的内容
+        fam, bnd = self._ensure_static_paths(r)
+        self._draw_family(p, r, fam)
+        self._draw_boundary(p, r, bnd)
+        self._draw_resonance_vlines(p, r)   # fnp/fnr 竖线（随 K 变化）
+        # 图例独立成条带 pixmap（见 _ensure_legend_strip），不在此层以免 Q 文本失效
+
+    def _draw_semi(self, p: QPainter, r: QRectF) -> None:
+        """Layer B：当前 Q 曲线 + fnp/fnr/峰值 marker（只随 Q/K 重建）。"""
+        cur = self._ensure_current_path(r)
+        self._draw_current(p, r, cur)
+        self._draw_semi_markers(p, r)
+
+    def _draw_background(self, p: QPainter, r: QRectF) -> None:
+        p.fillRect(r, QColor("white"))
+
+    def _draw_family(self, p: QPainter, r: QRectF, fam) -> None:
+        p.save()
+        p.setClipRect(r)
+        for path, col in zip(fam, FAMILY_COLORS):
+            p.setPen(QPen(_hex(col), 1.2))
+            if not path.isEmpty():
+                p.drawPath(path)
+        p.restore()
+
+    def _draw_current(self, p: QPainter, r: QRectF, cur) -> None:
+        p.save()
+        p.setClipRect(r)
+        p.setPen(QPen(_hex(CURRENT_COLOR), 2.6))
+        if cur is not None and not cur.isEmpty():
+            p.drawPath(cur)
+        p.restore()
+
+    def _draw_boundary(self, p: QPainter, r: QRectF, bnd) -> None:
+        if bnd is None or bnd.isEmpty():
+            return
+        p.save()
+        pen = QPen(_hex(BOUNDARY_COLOR), 3.2)
+        pen.setStyle(Qt.DashLine)
+        pen.setDashPattern([10.0, 4.0])
+        p.setPen(pen)
+        p.setClipRect(r)
+        p.drawPath(bnd)
+        p.restore()
+        # 线旁标注（跟随 K 自动调整，尽量避开峰值区）
+        self._draw_boundary_label(p, r, bnd)
+
+    def _draw_boundary_label(self, p: QPainter, r: QRectF, bnd) -> None:
+        """在阻容分界线上方绘制 <阻容分界 ∠Zin=0> 小标签。"""
+        fn_lab = 0.9
+        if not (FN_MIN < fn_lab <= 1.0):
+            return
+        mb = boundary_gain(fn_lab, self.K)
+        if mb is None or not math.isfinite(mb):
+            return
+        x = self._map_x(fn_lab, r)
+        if x < r.left() or x > r.right():
+            return
+        y = self._map_y_full(mb, r)
+        font = self._legend_font(float(self.height()))
+        p.save()
+        p.setFont(font)
+        met = QFontMetrics(font)
+        label = "阻容分界  ∠Zin=0"
+        tw = met.horizontalAdvance(label)
+        th = met.height()
+        pad = 3
+        box = QRectF(x - tw / 2 - pad, y - th - 8, tw + 2 * pad, th + 2 * pad)
+        # 保持在图内
+        if box.left() < r.left():
+            box.moveLeft(r.left() + 2)
+        if box.right() > r.right():
+            box.moveRight(r.right() - 2)
+        if box.top() < r.top():
+            box.moveTop(r.top() + 2)
+        p.setBrush(QColor(255, 255, 255, 235))
+        p.setPen(QPen(_hex(BOUNDARY_LABEL_COLOR), 1.0))
+        p.drawRect(box)
+        p.setPen(_hex(BOUNDARY_LABEL_COLOR))
+        p.drawText(box, Qt.AlignCenter, label)
+        p.restore()
+
+    def _draw_grid(self, p: QPainter, r: QRectF) -> None:
+        p.save()
+        p.setClipRect(r)
+        # 主网格（log 横轴各位 + Y nice 刻度）
+        pen = QPen(QColor(0, 0, 0, 60))
+        pen.setWidthF(0.7)
+        p.setPen(pen)
+        for dec in range(-6, 7):
+            v = 10.0 ** dec
+            if FN_MIN <= v <= FN_MAX:
+                x = self._map_x(v, r)
+                p.drawLine(x, r.top(), x, r.bottom())
+        for v in self._y_ticks():
+            y = self._map_y(v, r)
+            p.drawLine(r.left(), y, r.right(), y)
+        # 次网格（log 横轴 2..9 每 decade）—— 用可辨识的实线浅灰，避免与主网混淆但可见
+        pen2 = QPen(QColor(0, 0, 0, 42))
+        pen2.setWidthF(0.5)
+        p.setPen(pen2)
+        for v in self._minor_log_freqs():
+            x = self._map_x(v, r)
+            p.drawLine(x, r.top(), x, r.bottom())
+        p.restore()
+
+    def _draw_semi_markers(self, p: QPainter, r: QRectF) -> None:
+        """fnp/fnr 标记与当前 Q 峰值点（Layer B，只随 Q/K 变化）。"""
+        p.save()
+        fnp = self.fnp
+        fnr = self.fnr
+        fn_peak, m_peak = self.peak
+
+        def draw(xpx, ypx, shape: str, color: QColor):
+            p.setPen(QPen(color, 2.0))
+            p.setBrush(Qt.NoBrush)
+            rad = 5.0
+            if shape == "circle":
+                p.drawEllipse(xpx - rad, ypx - rad, 2 * rad, 2 * rad)
+            elif shape == "square":
+                p.drawRect(xpx - rad, ypx - rad, 2 * rad, 2 * rad)
+            elif shape == "diamond":
+                p.drawPolygon(QPolygonF([
+                    QPointF(xpx, ypx - rad), QPointF(xpx + rad, ypx),
+                    QPointF(xpx, ypx + rad), QPointF(xpx - rad, ypx)]))
+            elif shape == "triangle":
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(_hex(CURRENT_COLOR), 2.0))
+                p.drawPolygon(QPolygonF([
+                    QPointF(xpx, ypx - rad), QPointF(xpx + rad, ypx + rad),
+                    QPointF(xpx - rad, ypx + rad)]))
+
+        draw(self._map_x(fnp, r), self._map_y(float(llc_gain(fnp, self.K, self.Q)), r),
+             "circle", _hex(FNP_COLOR))
+        draw(self._map_x(fnr, r), self._map_y(float(llc_gain(fnr, self.K, self.Q)), r),
+             "square", _hex(FNR_COLOR))
+        if math.isfinite(fn_peak) and math.isfinite(m_peak):
+            draw(self._map_x(fn_peak, r), self._map_y(m_peak, r),
+                 "triangle", _hex(CURRENT_COLOR))
+        p.restore()
+
+    def _draw_axes(self, p: QPainter, r: QRectF) -> None:
+        p.save()
+        # 主次框线
+        p.setPen(QPen(QColor(40, 40, 40), 1.0))
+        p.drawLine(r.left(), r.bottom(), r.right(), r.bottom())
+        p.drawLine(r.left(), r.top(), r.left(), r.bottom())
+        # X 主刻度（十进制）
+        for dec in range(-6, 7):
+            v = 10.0 ** dec
+            if FN_MIN <= v <= FN_MAX:
+                x = self._map_x(v, r)
+                p.drawLine(x, r.bottom(), x, r.bottom() + 5)
+        # Y 主刻度（nice ticks）
+        for v in self._y_ticks():
+            y = self._map_y(v, r)
+            p.drawLine(r.left() - 5, y, r.left(), y)
+        p.restore()
+
+    def _draw_labels(self, p: QPainter, r: QRectF) -> None:
+        p.save()
+        font = self.font() or QFont()
+        font.setPointSizeF(max(8.0, self.height() / 90.0))
+        p.setFont(font)
+        met = p.fontMetrics()
+        p.drawText(QRectF(r.left(), r.bottom() + 8, r.width(), 22),
+                   Qt.AlignHCenter, "归一化频率 fn = fs / fr")
+        # y 轴标签（旋转）
+        p.save()
+        p.translate(r.left() - 40, r.top() + r.height() / 2)
+        p.rotate(-90)
+        p.drawText(QRectF(-r.height() / 2, 0, r.height(), 22),
+                   Qt.AlignHCenter, "增益 Mg")
+        p.restore()
+        # x 刻度文字
+        for dec in range(-6, 7):
+            v = 10.0 ** dec
+            if FN_MIN <= v <= FN_MAX:
+                x = self._map_x(v, r)
+                text = f"{v:g}"
+                tw = met.horizontalAdvance(text)
+                p.drawText(QRectF(x - tw / 2, r.bottom() + 6, tw, 16),
+                           Qt.AlignHCenter, text)
+        # y 刻度文字（nice ticks）
+        for v in self._y_ticks():
+            y = self._map_y(v, r)
+            text = self._fmt_ytick(v)
+            tw = met.horizontalAdvance(text)
+            p.drawText(QRectF(r.left() - 6 - tw, y - 8, tw, 16),
+                       Qt.AlignRight | Qt.AlignVCenter, text)
+        # 竖线标签
+        p.setPen(_hex(FNP_COLOR))
+        x = self._map_x(self.fnp, r)
+        p.drawText(QRectF(x + 4, r.top() + 4, 90, 18), Qt.AlignLeft, "fnp")
+        p.setPen(_hex(FNR_COLOR))
+        x = self._map_x(self.fnr, r)
+        p.drawText(QRectF(x + 4, r.top() + 22, 90, 18), Qt.AlignLeft, "fnr=1")
+        p.setPen(_hex(WORK_COLOR))
+        x = self._map_x(self.fn_work, r)
+        p.drawText(QRectF(x + 4, r.bottom() - 22, 90, 18), Qt.AlignLeft, "当前 fn")
+        p.restore()
+
+    @staticmethod
+    def _fmt_ytick(v: float) -> str:
+        if abs(v - round(v)) < 1e-9:
+            return f"{v:g}"
+        # 保留足够位避免 0.5 / 0.25 显示失真
+        s = f"{v:.6f}".rstrip("0").rstrip(".")
+        return s
+
+    def _legend_strip_geometry(self, w: float, h: float):
+        """图例条带尺寸与布局（基于窗口宽度/高度，独立于绘图区）。"""
+        avail = max(80.0, float(w) - 74.0 - 26.0)
+        lay = self._legend_layout(avail, max(80.0, float(h)))
+        entries = lay["entries"]
+        cols, rows = lay["cols"], lay["rows"]
+        row_h = lay["row_h"]
+        pad_x, pad_y = 10, 4
+        swatch = 16
+        cell_w = [swatch + 6 + ww for ww in self._col_widths(entries, cols, rows, lay)]
+        total_w = int(sum(cell_w) + (cols - 1) * 18 + 2 * pad_x)
+        total_h = int(rows * row_h + pad_y)
+        return lay, cell_w, total_w, total_h
+
+    def _draw_legend_at(self, p: QPainter, lay, cell_w, total_w, total_h,
+                        box_x: float, box_y: float) -> None:
+        entries = lay["entries"]
+        cols, rows = lay["cols"], lay["rows"]
+        row_h = lay["row_h"]
+        pad_x, pad_y = 10, 4
+        swatch = 16
+        for idx, (color, width, style, txt) in enumerate(entries):
+            col = idx % cols
+            row = idx // cols
+            x = box_x + pad_x + sum(cell_w[:col]) + col * 18
+            y = box_y + pad_y + row * row_h
+            pen = QPen(_hex(color), width)
+            pen.setStyle(style)
+            p.setPen(pen)
+            cx = x
+            p.drawLine(cx, y + row_h / 2, cx + swatch, y + row_h / 2)
+            p.setPen(QPen(QColor(20, 20, 20)))
+            p.drawText(QRectF(cx + swatch + 6, y, cell_w[col], row_h),
+                       Qt.AlignLeft | Qt.AlignVCenter, txt)
+
+    #: 图例条带 pixmap 缓存（随 Q/K/尺寸重建；fn 变化零重建）
+    _legend_pixmap = None
+    _legend_key = None
+
+    def _ensure_legend_strip(self, w: int, h: int) -> QPixmap | None:
+        """图例条带独立 pixmap：只在 Q/K/尺寸/布局变化时重建。"""
+        lay, cell_w, total_w, total_h = self._legend_strip_geometry(w, h)
+        key = (int(w), int(h), round(self.Q, 6), round(self.K, 6), lay["cols"])
+        if self._legend_pixmap is not None and self._legend_key == key:
+            return self._legend_pixmap
+        dpr = self.devicePixelRatioF()
+        pm = QPixmap(int(max(1, round(w * dpr))),
+                     int(max(1, round(total_h * dpr))))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        p.setBrush(QColor(255, 255, 255, 235))
+        p.setPen(QPen(QColor(0, 0, 0, 90), 0.8))
+        p.drawRect(QRectF(74.0, 4.0, total_w, total_h))
+        p.setFont(lay["font"])
+        self._draw_legend_at(p, lay, cell_w, total_w, total_h, 74.0, 4.0)
+        p.end()
+        self._legend_pixmap = pm
+        self._legend_key = key
+        return pm
+
+    def _draw_legend(self, p: QPainter, r: QRectF) -> None:
+        """导出/离屏路径用的图例（画在绘图区正上方条带）。"""
+        lay, cell_w, total_w, total_h = self._legend_strip_geometry(
+            float(self.width()), float(self.height()))
+        box_y = max(0.0, r.top() - total_h - 4)
+        p.save()
+        p.setFont(lay["font"])
+        p.setBrush(QColor(255, 255, 255, 235))
+        p.setPen(QPen(QColor(0, 0, 0, 90), 0.8))
+        p.drawRect(QRectF(74.0, box_y, total_w, total_h))
+        self._draw_legend_at(p, lay, cell_w, total_w, total_h, 74.0, box_y)
+        p.restore()
+
+    def _col_widths(self, entries, cols, rows, lay):
+        """按列分配：每列宽 = 该列内最宽条目的文字宽度。"""
+        widths = [0] * cols
+        n = len(entries)
+        txtw = lay["col_w"]
+        for idx in range(n):
+            col = idx % cols
+            if txtw[idx] > widths[col]:
+                widths[col] = txtw[idx]
+        return widths
+
+    def _draw_resonance_vlines(self, p: QPainter, r: QRectF) -> None:
+        """fnp / fnr 竖线（随 K/Q 变化，放基底）。"""
+        p.save()
+        p.setClipRect(r)
+        p.setPen(QPen(_hex(FNP_COLOR), 1.3, Qt.DashLine))
+        x = self._map_x(self.fnp, r)
+        p.drawLine(x, r.top(), x, r.bottom())
+        p.setPen(QPen(_hex(FNR_COLOR), 1.3, Qt.DashLine))
+        x = self._map_x(self.fnr, r)
+        p.drawLine(x, r.top(), x, r.bottom())
+        p.restore()
+
+    def _draw_work_vline(self, p: QPainter, r: QRectF) -> None:
+        """当前 fn 竖线（Overlay）。"""
+        p.save()
+        p.setPen(QPen(_hex(WORK_COLOR), 1.5, Qt.DotLine))
+        x = self._map_x(self.fn_work, r)
+        p.drawLine(x, r.top(), x, r.bottom())
+        p.restore()
+
+    def _draw_overlay(self, p: QPainter, r: QRectF) -> None:
+        """Layer C：fn 竖线 + 工作点 + Hover 高亮与 Tooltip。"""
+        self._draw_work_vline(p, r)
+        # 工作点菱形
+        mwork = float(llc_gain(self.fn_work, self.K, self.Q))
+        xw = self._map_x(self.fn_work, r)
+        yw = self._map_y(mwork, r)
+        p.save()
+        p.setPen(QPen(_hex(WORK_COLOR), 2.0))
+        p.setBrush(Qt.NoBrush)
+        rad = 5.0
+        p.drawPolygon(QPolygonF([
+            QPointF(xw, yw - rad), QPointF(xw + rad, yw),
+            QPointF(xw, yw + rad), QPointF(xw - rad, yw)]))
+        p.restore()
+        if self._hover is not None:
+            self._draw_hover(p, r)
+
+    # ------------------------------------------------------------------
+    # 基底 pixmap 缓存与 paintEvent
+    # ------------------------------------------------------------------
+    def _ensure_backdrop(self) -> QPixmap | None:
+        """不随 K 变化的背景层（白底+网格+坐标轴+刻度文字），独立缓存。
+
+        只按 widget 尺寸 / ymax / DPR / 字号重建。K/Q/fn 变化均完全复用，
+        是 K 拖动"不重画网格与文字"的关键。
+        """
+        w = int(self.width())
+        h = int(self.height())
+        if w <= 4 or h <= 4:
+            return None
+        dpr = self.devicePixelRatioF()
+        scale = self.height()
+        key = (w, h, round(self.ymax, 4), round(dpr, 4), int(scale))
+        if (self._backdrop_pixmap is not None
+                and self._backdrop_key == key):
+            return self._backdrop_pixmap
+        pm = QPixmap(int(round(w * dpr)), int(round(h * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(QColor("white"))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        r = self._plot_rect(w, h)
+        self._draw_background(p, r)
+        self._draw_grid(p, r)
+        self._draw_axes(p, r)
+        self._draw_labels(p, r)
+        p.end()
+        self._backdrop_pixmap = pm
+        self._backdrop_key = key
+        return pm
+
+    def _ensure_base(self) -> bool:
+        """在需要时重建基底 pixmap。返回本次是否重建。"""
+        w = int(self.width())
+        h = int(self.height())
+        if w <= 4 or h <= 4:
+            return False
+        dpr = self.devicePixelRatioF()
+        key = (w, h)
+        need = (self._base_pixmap is None
+                or self._base_dirty
+                or self._base_key_size != key
+                or abs(self._base_key_dpr - dpr) > 1e-6)
+        if not need:
+            return False
+        r = self._plot_rect(w, h)
+        pm = QPixmap(int(round(w * dpr)), int(round(h * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(QColor("white"))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        self._draw_scene_static(p, r)
+        p.end()
+        self._base_pixmap = pm
+        self._base_dirty = False
+        self._base_key_size = key
+        self._base_key_dpr = dpr
+        return True
+
+    def _ensure_semi_pixmap(self, r: QRectF) -> QPixmap | None:
+        """Layer B 缓存：当前 Q 曲线 + fnp/fnr/峰值 marker 合成图。
+
+        只随 Q / K / plot 尺寸变化重建。fn 拖动零重建，paintEvent 直接 blit。
+        """
+        w = int(self.width())
+        h = int(self.height())
+        if w <= 4 or h <= 4:
+            return None
+        key = (w, h, round(self.Q, 6), round(self.K, 6))
+        if self._semi_pixmap is not None and self._semi_key == key:
+            return self._semi_pixmap
+        dpr = self.devicePixelRatioF()
+        pm = QPixmap(int(round(w * dpr)), int(round(h * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        self._draw_semi(p, r)
+        p.end()
+        self._semi_pixmap = pm
+        self._semi_key = key
+        return pm
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        _t0 = self._time.perf_counter() if self._collect_perf else None
+        self._ensure_base()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        if self._base_pixmap is not None:
+            painter.drawPixmap(0, 0, self._base_pixmap)
+            lg = self._ensure_legend_strip(self.width(), self.height())
+            if lg is not None:
+                painter.drawPixmap(0, 0, lg)   # 顶部图例条带
+            r = self._plot_rect(self.width(), self.height())
+            semi = self._ensure_semi_pixmap(r)   # Layer B（Q/K 缓存）
+            if semi is not None:
+                painter.drawPixmap(0, 0, semi)
+            self._draw_overlay(painter, r)       # Layer C：fn/工作点/Hover
+        painter.end()
+        if _t0 is not None:
+            self._paint_ms.append((self._time.perf_counter() - _t0) * 1000.0)
+
+    # ------------------------------------------------------------------
+    # Hover Inspector
+    # ------------------------------------------------------------------
+    def _clear_hover_state(self):
+        self._hover = None
+        self._hover_rect = None
+        self._hover_mouse = None
+
+    def _candidates(self, fn_mouse):
+        """返回候选曲线列表（每条含 kind / q / 颜色 / 曲线值函数）。"""
+        out = []
+        for q, col in zip(Q_FAMILY, FAMILY_COLORS):
+            out.append({"kind": "family", "q": float(q), "color": col})
+        out.append({"kind": "current", "q": float(self.Q),
+                    "color": CURRENT_COLOR})
+        out.append({"kind": "boundary", "q": None, "color": BOUNDARY_COLOR})
+        return out
+
+    def _curve_m_at(self, kind, q, fn_mouse):
+        """某候选曲线在 fn_mouse 处的精确增益（标量，仅 1 个点）。"""
+        if kind == "boundary":
+            m = boundary_gain(fn_mouse, self.K)
+            return m
+        return float(llc_gain(fn_mouse, self.K, q))
+
+    def hit_test(self, screen_x: float, screen_y: float, plot_rect: QRectF = None):
+        """命中检测：纯数学 + 像素距离，O(候选数) 复杂度。
+
+        返回 hit dict 或 None（超过容差）。``plot_rect`` 缺省用当前尺寸。
+        """
+        r = plot_rect or self._plot_rect(float(self.width()), float(self.height()))
+        if r.width() <= 0.0 or r.height() <= 0.0:
+            return None
+        fn_mouse = self.pixel_to_fn(screen_x, r)
+        if not (FN_MIN <= fn_mouse <= FN_MAX) or math.isnan(fn_mouse):
+            return None
+        tol = HOVER_TOL_PX
+        best = None
+        for cand in self._candidates(fn_mouse):
+            kind = cand["kind"]
+            m = self._curve_m_at(kind, cand["q"], fn_mouse)
+            if m is None or math.isnan(m):
+                continue
+            py = self._map_y_full(m, r)
+            # 只考虑在图内 ± 容差范围的候选（避免远处误判/溢出像素）
+            if py < r.top() - tol or py > r.bottom() + tol:
+                continue
+            if screen_y is None:
+                return None
+            dist = abs(py - screen_y)
+            if dist > tol:
+                continue
+            prio = _HOVER_PRIORITY[kind]
+            if best is None or dist < best["dist"] - 1e-9 or (
+                    abs(dist - best["dist"]) <= 1e-9 and prio < best["priority"]):
+                best = {
+                    "kind": kind, "q": cand["q"], "color": cand["color"],
+                    "fn": fn_mouse, "m": m,
+                    "screen_x": self._map_x(fn_mouse, r), "screen_y": py,
+                    "dist": dist, "priority": prio,
+                    "qb": None, "mb": None,
+                }
+        if best is None:
+            return None
+        # 补充边界量 / 区域
+        best["region"] = input_region(fn_mouse, self.K, self.Q)
+        if best["kind"] == "boundary":
+            best["mb"] = boundary_gain(fn_mouse, self.K)
+            best["qb"] = q_boundary_for_fn(fn_mouse, self.K)
+        return best
+
+    def _tooltip_lines(self, hit) -> list:
+        if hit["kind"] == "boundary":
+            lines = [
+                "阻容分界线",
+                "∠Zin = 0",
+                f"K = {self.K:.3f}",
+                f"fn = {hit['fn']:.4f}",
+                f"Mb = {_fmt_bound_val(hit['mb'])}",
+                f"Qb = {_fmt_bound_val(hit['qb'])}",
+            ]
+        else:
+            lines = [
+                f"Q = {hit['q']:.3f}",
+                f"K = {self.K:.3f}",
+                f"fn = {hit['fn']:.4f}",
+                f"M = {hit['m']:.4f}",
+            ]
+        lines.append(f"fs = {_fmt_freq(hit['fn'] * self.fr_khz * 1000.0)}")
+        lines.append(f"区域：{_REGION_LABEL.get(hit['region'], hit['region'])}")
+        return lines
+
+    def _tooltip_geometry(self, mouse_pos, lines, widget_w, widget_h):
+        """Tooltip 位置：鼠标右上方，空间不足时翻转。返回 (rect, lines)。"""
+        font = self._legend_font(float(widget_h))
+        met = QFontMetrics(font)
+        pad_x, pad_y = 8, 6
+        line_h = met.height() + 2
+        w = max((met.horizontalAdvance(t) for t in lines), default=80) + 2 * pad_x
+        h = len(lines) * line_h + 2 * pad_y + 4
+        x = mouse_pos.x() + 12
+        y = mouse_pos.y() - 12 - h
+        if x + w > widget_w - 2:
+            x = mouse_pos.x() - 12 - w
+        if y < 2:
+            y = mouse_pos.y() + 14
+        if y + h > widget_h - 2:
+            y = widget_h - 2 - h
+        return QRect(int(x), int(y), int(w), int(h))
+
+    def _draw_hover(self, p: QPainter, r: QRectF) -> None:
+        hit = self._hover
+        if hit is None or self._hover_mouse is None:
+            return
+        # 高亮圆点
+        rad = 5.0
+        px, py = hit["screen_x"], hit["screen_y"]
+        p.save()
+        p.setPen(QPen(QColor("white"), 2.6))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QRectF(px - rad - 1.2, py - rad - 1.2,
+                             2 * (rad + 1.2), 2 * (rad + 1.2)))
+        p.setPen(QPen(_hex(hit["color"]), 2.2))
+        p.drawEllipse(QRectF(px - rad, py - rad, 2 * rad, 2 * rad))
+        p.restore()
+        # Tooltip
+        lines = self._tooltip_lines(hit)
+        tg = self._tooltip_geometry(self._hover_mouse, lines,
+                                    float(self.width()), float(self.height()))
+        p.save()
+        p.setFont(self._legend_font(float(self.height())))
+        p.setBrush(QColor(255, 255, 255, 242))
+        p.setPen(QPen(QColor(200, 200, 200), 1.0))
+        p.drawRect(tg)
+        font = self._legend_font(float(self.height()))
+        p.setFont(font)
+        met = QFontMetrics(font)
+        pad_x, pad_y = 8, 6
+        line_h = met.height() + 2
+        ty = tg.top() + pad_y
+        for line in lines:
+            p.drawText(QRectF(tg.left() + pad_x, ty, tg.width() - 2 * pad_x, line_h),
+                       Qt.AlignLeft | Qt.AlignVCenter, line)
+            ty += line_h
+        p.restore()
+        # 记录当前 rect 供局部刷新
+        self._hover_rect = tg
+
+    def _hover_dirty_rect(self) -> QRect | None:
+        """合并旧/新 hover 高亮与 tooltip 的脏矩形（用于局部 update）。"""
+        rects = []
+        if self._hover_mouse is not None and self._hover is not None:
+            rad = 8
+            hx, hy = self._hover["screen_x"], self._hover["screen_y"]
+            rects.append(QRect(int(hx - rad), int(hy - rad), 2 * rad, 2 * rad))
+        if self._hover_rect is not None:
+            rects.append(self._hover_rect)
+        if not rects:
+            return None
+        union = QRect(rects[0])
+        for rt in rects[1:]:
+            union = union.united(rt)
+        return union.adjusted(-4, -4, 4, 4)
+
+    def _update_hover(self, pos) -> None:
+        old_rect = self._hover_dirty_rect()
+        old_hover = self._hover
+        _t0 = self._time.perf_counter() if self._collect_perf else None
+        hit = self.hit_test(pos.x(), pos.y())
+        if _t0 is not None:
+            self._hover_ms.append((self._time.perf_counter() - _t0) * 1000.0)
+        self._hover = hit
+        self._hover_mouse = pos
+        new_rect = self._hover_dirty_rect()
+        union = old_rect
+        if new_rect is not None:
+            union = union.united(new_rect) if union else new_rect
+        if union is not None:
+            self.update(union)
+        elif old_hover is not None or hit is not None:
+            self.update()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        self._update_hover(event.position())
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        if self._hover is not None:
+            self._clear_hover_state()
+            self.update()
+        super().leaveEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._base_key_size = (-1, -1)
+        self._base_dirty = True
+        self._invalidate_geometry()
+        self._clear_hover_state()
+        super().resizeEvent(event)
+
+    # ------------------------------------------------------------------
+    # 导出 PNG（QPixmap/QImage/QPainter）
+    # ------------------------------------------------------------------
+    def _draw_scene(self, p: QPainter, r: QRectF, on_base: bool = True) -> None:
+        """导出用完整场景（任意尺寸）：backdrop + 参考族 + 边界 + 谐振竖线 +
+        Layer B（当前曲线/标记）+ 图例。``on_base`` 仅用于与旧签名兼容。
+        """
+        self._draw_background(p, r)
+        self._draw_grid(p, r)
+        self._draw_axes(p, r)
+        self._draw_labels(p, r)
+        fam, bnd = self._ensure_static_paths(r)
+        self._draw_family(p, r, fam)
+        self._draw_boundary(p, r, bnd)
+        self._draw_resonance_vlines(p, r)
+        self._draw_semi(p, r)
+        self._draw_legend(p, r)
+
+    def render_to_png(self, path: str, size: QSize = QSize(1440, 900)) -> str:
+        self._clear_hover_state()
+        image = QImage(size, QImage.Format_ARGB32_Premultiplied)
+        image.fill(QColor("white"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        r = QRectF(0.0, 0.0, size.width(), size.height())
+        # PNG 用独立尺寸场景直接渲染（不用当前 widget 缓存，因尺寸不同）
+        self._draw_scene(painter, self._plot_rect(size.width(), size.height()),
+                         on_base=False)
+        self._draw_overlay(painter, self._plot_rect(size.width(), size.height()))
+        painter.end()
+        if not os.path.isabs(path):
+            path = os.path.abspath(path)
+        ok = image.save(path, "PNG")
+        if not ok:  # pragma: no cover
+            raise OSError(f"保存 PNG 失败：{path}")
+        return path
+
+    @staticmethod
+    def _hist(samples) -> dict:
+        if not samples:
+            return {"n": 0, "p50": float("nan"), "p95": float("nan"),
+                    "max": float("nan")}
+        s = sorted(samples)
+        n = len(s)
+        def pct(p):
+            i = min(n - 1, int(p * n))
+            return s[i]
+        return {"n": n, "p50": round(pct(0.5), 4), "p95": round(pct(0.95), 4),
+                "max": round(pct(1.0), 4)}
+
+    def perf_stats(self) -> dict:
+        """paint / hover 耗时分位数（P50/P95/max，ms）。"""
+        return {"paint": self._hist(self._paint_ms),
+                "hover": self._hist(self._hover_ms)}
+
+    # 兼容 llc_plot 读取接口（供测试/导出）
+    def artist_census(self) -> dict:
+        return {
+            "lines": 1 + len(Q_FAMILY),      # 当前 + 族（QPainter 无持久对象）
+            "texts": 0,
+            "collections": 0,
+            "patches": 0,
+            "legends": 1,
+            "data_lists": sum(1 for y in self.family_y) + 2,
+            "cache_paths": 3,
+            "cache_base": 1,
+        }

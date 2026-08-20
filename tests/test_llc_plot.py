@@ -54,9 +54,9 @@ def plot():
 # 对象创建与默认状态
 # ---------------------------------------------------------------------------
 def test_artist_counts_on_creation(plot):
-    """9 条参考曲线 + 1 条当前 Q + 3 条竖线 + 4 个标记 = 17 条 Line2D。"""
+    """9 条参考曲线 + 1 条当前 Q + 1 条阻容边界 + 3 条竖线 + 4 个标记 = 18 条 Line2D。"""
     assert len(plot.hFamily) == len(Q_FAMILY) == 9
-    assert len(plot.ax.lines) == 17
+    assert len(plot.ax.lines) == 18
     # 3 个竖线文字标签
     assert len(plot.ax.texts) == 3
 
@@ -118,7 +118,7 @@ def test_no_artist_growth_under_heavy_updates(plot):
 def test_artist_identity_preserved(plot):
     """所有关键对象必须是同一批实例（id 不变）。"""
     ids_before = tuple(id(o) for o in (
-        plot.hCurrent, plot.hFnpLine, plot.hFnrLine, plot.hWorkLine,
+        plot.hCurrent, plot.hBoundary, plot.hFnpLine, plot.hFnrLine, plot.hWorkLine,
         plot.txtFnp, plot.txtFnr, plot.txtWork,
         plot.hFnpPoint, plot.hFnrPoint, plot.hPeakPoint, plot.hWorkPoint,
         *plot.hFamily,
@@ -127,7 +127,7 @@ def test_artist_identity_preserved(plot):
         plot.update(1.5 + i * 0.28, 0.05 + i * 0.3, 0.1 + i * 0.3,
                     DEFAULT_FR_KHZ, 2.2)
     ids_after = tuple(id(o) for o in (
-        plot.hCurrent, plot.hFnpLine, plot.hFnrLine, plot.hWorkLine,
+        plot.hCurrent, plot.hBoundary, plot.hFnpLine, plot.hFnrLine, plot.hWorkLine,
         plot.txtFnp, plot.txtFnr, plot.txtWork,
         plot.hFnpPoint, plot.hFnrPoint, plot.hPeakPoint, plot.hWorkPoint,
         *plot.hFamily,
@@ -153,7 +153,8 @@ def test_legend_explains_four_markers(plot):
     assert "fnr=1" in joined
     assert "峰值" in joined
     assert "工作点 fn" in joined
-    assert len(labels) == 14, "图例应含 9 条参考 Q + 当前 Q + 4 个标记"
+    assert "阻容分界线" in joined
+    assert len(labels) == 15, "图例应含 9 条参考 Q + 当前 Q + 阻容边界 + 4 个标记"
 
 
 def test_legend_shows_dynamic_q_value(plot):

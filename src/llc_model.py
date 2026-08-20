@@ -54,6 +54,12 @@ __all__ = [
     "make_fn_curve",
     "find_peak",
     "to_real_frequency",
+    # ---- 阻容分界线（Zin 相位判据）----
+    "llc_input_impedance_normalized",
+    "q_boundary_for_fn",
+    "boundary_gain",
+    "boundary_frequency",
+    "input_region",
 ]
 
 # ---------------------------------------------------------------------------
@@ -200,3 +206,151 @@ def to_real_frequency(fn, fr_khz: float):
     """把归一化频率换算成实际频率（kHz）：``f = fn * fr``。"""
     return np.asarray(fn, dtype=float) * float(fr_khz) if not np.isscalar(fn) \
         else float(fn) * float(fr_khz)
+
+
+# ---------------------------------------------------------------------------
+# 阻容分界线：输入阻抗相位判据（∠Zin = 0）
+# ---------------------------------------------------------------------------
+# 谐振特性阻抗 Zr = sqrt(Lr/Cr)，Q = Zr/Re。
+# 将输入阻抗除以 Zr 得到无量纲形式：
+#
+#     z_in = j(fn - 1/fn) + j·K·fn / (1 + j·K·Q·fn)
+#
+# 实部/虚部解析展开：
+#     令 a = K·fn，b = K·Q·fn
+#     Re(z_in) = a·b / (1 + b²)            = K²·Q·fn² / (1 + (K·Q·fn)²)
+#     Im(z_in) = (fn - 1/fn) + a/(1 + b²)  = fn - 1/fn + K·fn / (1 + (K·Q·fn)²)
+#
+# 阻容分界条件　Im(z_in) = 0：
+#     fn - 1/fn + K·fn / (1 + (K·Q·fn)²) = 0
+#
+# 固定 K 时该方程对 Q 有解析解（有效区间 fm < fn < 1）：
+#     Qb(fn) = sqrt( ((K+1)·fn² - 1) / (K²·fn²·(1 - fn²)) ),  fm = 1/sqrt(K+1)
+#
+# 把　Im=0 条件代入 FHA 增益公式可解析化简为边界增益：
+#     Mb(fn) = sqrt( K·fn² / ((K+1)·fn² - 1) )
+#
+# 固定 K、Q 时的边界交点频率（数值稳定二次形式，A=(KQ)²，B=K+1-A）：
+#     fnb² = 2 / (B + sqrt(B² + 4A))，Q→0 极限 fnb = 1/sqrt(K+1)
+
+
+def llc_input_impedance_normalized(fn, k_ratio: float, q: float):
+    """无量纲输入阻抗 ``z_in = j(fn − 1/fn) + j·K·fn / (1 + j·K·Q·fn)``。
+
+    支持标量与数组输入。返回与 ``fn`` 同形状的复数数组/复数。
+    阻容分界对应其虚部为 0（∠Zin = 0），见 :func:`input_region`。
+    """
+    fn_arr = np.asarray(fn, dtype=float)
+    k_ratio_f = float(k_ratio)
+    q_f = float(q)
+    a = k_ratio_f * fn_arr            # K·fn
+    b = k_ratio_f * q_f * fn_arr      # K·Q·fn
+    den = 1.0 + b * b
+    re = a * b / den
+    im = (fn_arr - 1.0 / fn_arr) + a / den
+    return re + 1j * im
+
+
+def q_boundary_for_fn(fn, k_ratio: float):
+    """固定 K 时，阻容边界处的 Q 值 ``Qb(fn)``。
+
+    仅在　``1/sqrt(K+1) < fn < 1``　区间内有效并返回实数；
+    区间外返回 ``nan``。
+    """
+    fn_arr = np.asarray(fn, dtype=float)
+    u = fn_arr * fn_arr
+    k = float(k_ratio)
+    num = (k + 1.0) * u - 1.0
+    den = k * k * u * (1.0 - u)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        qb2 = num / den
+    qb = np.sqrt(np.where((num > 0.0) & (den > 0.0), qb2, np.nan))
+    if fn_arr.ndim == 0 or np.isscalar(fn):
+        return float(qb)
+    return qb
+
+
+def boundary_gain(fn, k_ratio: float):
+    """阻容边界增益 ``Mb(fn) = sqrt( K·fn² / ((K+1)·fn² − 1) )``。
+
+    该式是把　``Im(z_in)=0``　代入 FHA 增益公式的解析结果，是
+    **严格边界**，而非任何单条 Q 曲线的峰值。
+    在　``fn → 1/sqrt(K+1)``　处趋于正无穷；区间下方返回 ``nan``。
+    """
+    fn_arr = np.asarray(fn, dtype=float)
+    u = fn_arr * fn_arr
+    k = float(k_ratio)
+    den = (k + 1.0) * u - 1.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m2 = k * u / den
+    m = np.sqrt(np.where(den > 0.0, m2, np.nan))
+    if fn_arr.ndim == 0 or np.isscalar(fn):
+        return float(m)
+    return m
+
+
+def boundary_frequency(k_ratio: float, q: float) -> float:
+    r"""固定 K、Q 时，该 Q 增益曲线与阻容边界的交点归一化频率 ``fnb``。
+
+    由 ``Im(z_in)=0`` 得二次方程 ``A x² + B x − 1 = 0``，``x=fnb²``，
+    ``A=(K·Q)²``，``B=K+1−A``。取正根并**按符号 B 分支**避免二次求根相消
+    （quadratic root cancellation，两个接近大数相减会丢失有效位）：
+
+    * ``Q=0``：解析极限 ``fnb = 1/sqrt(1+K)``；
+    * ``B>=0``：``x = 2/(B + D)``（有理化形式，避免 −B+D 相消）；
+    * ``B<0``：``x = (−B + D)/(2A)``（此时 −B 与 D 均为正、相加，无相消）；
+    * 判别式 ``D = sqrt(B² + 4A)`` 以 ``hypot(B, 2·sqrt(A))`` 计算，
+      避免 ``B²+4A`` 中间量无意义 overflow。
+
+    返回值必然落在 ``[1/sqrt(1+K), 1]``。非法输入（K<=0、Q<0、NaN、±inf）
+    抛出 :class:`ValueError`。注意：这两个公式数学上等价于同一正根，
+    但不能合并成单一公式——``2/(B+D)`` 在 B<0 时自身会出现相消。
+    """
+    import math as _m
+
+    if k_ratio is None or q is None:
+        raise ValueError("K 与 Q 不能为 None")
+    try:
+        k = float(k_ratio)
+        q = float(q)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - 类型测试分支
+        raise ValueError(f"K/Q 必须可转为有限标量：K={k_ratio!r}, Q={q!r}") from exc
+    if not (_m.isfinite(k) and _m.isfinite(q)):
+        raise ValueError(f"K/Q 必须为有限数（禁止 NaN/±inf）：K={k_ratio!r}, Q={q!r}")
+    if k <= 0.0:
+        raise ValueError(f"K 必须 > 0：K={k_ratio!r}")
+    if q < 0.0:
+        raise ValueError(f"Q 必须 >= 0：Q={q!r}")
+
+    fnp = 1.0 / np.sqrt(1.0 + k)
+    if q == 0.0:
+        return fnp
+    a_kq = k * q                       # sqrt(A)（K、Q 非负）
+    if not _m.isfinite(a_kq):
+        # 已超出双精度可分辨范围，fb 理论值 → 1⁻，在表示极限处饱和到 1.0
+        return 1.0
+    a = a_kq * a_kq                    # A = (K·Q)²
+    b = (k + 1.0) - a                  # B = K+1−A
+    d = np.hypot(b, 2.0 * a_kq)        # sqrt(B² + 4A)，hypot 防 overflow
+    if b >= 0.0:
+        u = 2.0 / (b + d)              # B+D 无相消
+    else:
+        u = (-b + d) / (2.0 * a)       # −B 与 D 相加，无相消
+    if not (0.0 < u <= 1.0):
+        u = min(max(u, 0.0), 1.0)
+    f = np.sqrt(u)
+    return float(max(fnp, min(f, 1.0)))
+
+
+def input_region(fn, k_ratio: float, q: float, tol: float = 1e-9) -> str:
+    """根据输入阻抗虚部判定工作点所在区域。
+
+    返回 ``"inductive"``（感性，∠Zin>0）、``"capacitive"``（容性，∠Zin<0）
+    或 ``"boundary"``（阻容边界，|Im(z_in)| ≤ tol）。
+    判据直接来自 :func:`llc_input_impedance_normalized` 的虚部，绝非肉眼估计。
+    """
+    z = llc_input_impedance_normalized(fn, k_ratio, q)
+    im = np.imag(z) if np.ndim(z) else float(z.imag)
+    if abs(float(im)) <= tol:
+        return "boundary"
+    return "inductive" if float(im) > 0.0 else "capacitive"
