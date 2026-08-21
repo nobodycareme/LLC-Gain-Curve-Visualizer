@@ -16,6 +16,10 @@ __all__ = [
     "build_analysis",
     "build_suggestions",
     "compile_report",
+    "format_key_results",
+    "format_detail_results",
+    "format_short_analysis",
+    "format_short_suggestions",
 ]
 
 
@@ -57,7 +61,9 @@ def format_working_point(v: dict) -> str:
         "fs   = " + _fmt(v.get("fn", 1.0) * v.get("fr_khz", 0.0), 3) + " kHz",
         "fnp  = " + _fmt(fnp),
         "fp   = " + _fmt(fnp * v.get("fr_khz", 0.0), 3) + " kHz",
+        "M(fnp)= " + _fmt(v.get("Mfnp")),
         "fnr  = " + _fmt(fnr),
+        "M(fnr)= " + _fmt(v.get("Mfnr")),
         "Mpeak= " + _fmt(v.get("Mpeak")),
         "fnpeak=" + _fmt(v.get("fn_peak")),
         "fn_boundary = " + _fmt(v.get("fn_boundary")),
@@ -131,8 +137,8 @@ def _n(x):
 
 def _rect_label(r) -> str:
     return {
-        "ct_diode": "中心抽头+二极管", "ct_sr": "中心抽头+SR",
-        "fb_diode": "全桥整流+二极管", "fb_sr": "全桥整流+SR",
+        "ct_diode": "中心抽头二极管整流", "ct_sr": "中心抽头同步整流",
+        "fb_diode": "全桥二极管整流", "fb_sr": "全桥同步整流",
     }.get(r, str(r))
 
 
@@ -267,3 +273,99 @@ def compile_report(v: dict, e: dict, stress: dict) -> str:
              "【工程设计结果】", format_design_results(e), "",
              "【电流与应力】", format_stress_results(stress)]
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 右侧精简分层（需求 5.1）：默认只显示关键结果 + 精简分析/建议；
+# 详细辅助诊断移到可展开的"详细信息"区（默认折叠）。
+# ---------------------------------------------------------------------------
+
+def format_key_results(v: dict, e: dict | None = None,
+                       s: dict | None = None) -> str:
+    """右侧默认【关键结果】精简区块：关键信息前置，辅助诊断移入详细信息。"""
+    lines = ["【关键结果】"]
+    lines.append("当前：")
+    lines.append("  K    = " + _fmt(v.get("K")))
+    lines.append("  Q    = " + _fmt(v.get("Q")))
+    lines.append("  fn   = " + _fmt(v.get("fn")))
+    lines.append("  M(fn)= " + _fmt(v.get("Mfn")))
+    lines.append("  fs   = " + _fmt(v.get("fn", 1.0) * v.get("fr_khz", 0.0), 3)
+                 + " kHz")
+    if e:
+        lines.append("工程：")
+        lines.append("  n    = " + _fmt(e.get("n")))
+        lines.append("  Lr   = " + _fmt(_h(e.get("Lr_calc")), 2, " µH"))
+        lines.append("  Lm   = " + _fmt(_h(e.get("Lm_calc")), 2, " µH"))
+        lines.append("  Cr   = " + _fmt(_n(e.get("Cr_calc")), 2, " nF"))
+        lines.append("  M_req_min = " + _fmt(e.get("M_req_min")))
+        lines.append("  M_req_max = " + _fmt(e.get("M_req_max")))
+        lines.append("  Q_full    = " + _fmt(e.get("Q_full")))
+        lines.append("  Q_overload= " + _fmt(e.get("Q_overload")))
+        lines.append("  fn_min    = " + _fmt(e.get("fn_min")))
+        lines.append("  fn_max    = " + _fmt(e.get("fn_max")))
+        lines.append("  fs_min    = " + _fmt(e.get("fs_min", 0.0), 3) + " kHz")
+        lines.append("  fs_max    = " + _fmt(e.get("fs_max", 0.0), 3) + " kHz")
+    if s:
+        lines.append("最坏电流：")
+        lines.append("  Ioe = " + _fmt(s.get("ioe_rms")) + " A")
+        lines.append("  Im  = " + _fmt(s.get("im_rms")) + " A")
+        lines.append("  Ir  = " + _fmt(s.get("ir_rms")) + " A")
+        cr = s.get("cr") or {}
+        if cr:
+            lines.append("Cr 应力：")
+            lines.append("  Irms = " + _fmt(cr.get("icr_rms")) + " A")
+            lines.append("  Vpeak= " + _fmt(cr.get("vcr_peak")) + " V")
+    return "\n".join(lines)
+
+
+def format_detail_results(v: dict, e: dict | None = None,
+                          s: dict | None = None) -> str:
+    """详细信息（默认折叠）：参数定义 + 完整工作点/工程/应力 + 完整分析/建议。"""
+    parts = [
+        "【参数定义】",
+        "  K  = Lm / Lr",
+        "  fn = fs / fr",
+        "  Q  = sqrt(Lr/Cr) / Rac",
+        "",
+        "【当前工作点】", format_working_point(v),
+    ]
+    if e:
+        parts += ["", "【工程设计结果】", format_design_results(e)]
+    if s:
+        parts += ["", "【电流与应力】", format_stress_results(s)]
+    if e:
+        parts += ["", "【分析】", "\n".join(
+            "  " + flag + " " + msg for flag, msg in build_analysis(e, s))]
+        parts += ["", "【建议】", "\n".join(
+            "  • " + x for x in build_suggestions(e))]
+    return "\n".join(parts)
+
+
+#: 分析项优先级：✕ > ⚠ > ✓（严重问题优先展示）
+_FLAG_ORDER = {"✕": 0, "⚠": 1, "✓": 2}
+
+
+def format_short_analysis(e: dict | None, s: dict | None = None,
+                          max_items: int = 6) -> str:
+    """右侧默认【分析】精简区块：只保留最重要的前 max_items 条（需求 5.1）。
+
+    按 ✕/⚠/✓ 优先级排序后截取，避免默认视图被大量辅助诊断占满。
+    """
+    if not e:
+        return ""
+    items = build_analysis(e, s)
+    items = sorted(items, key=lambda it: _FLAG_ORDER.get(it[0], 9))
+    items = items[:max_items]
+    return "【分析】\n" + "\n".join(
+        "  " + flag + " " + msg for flag, msg in items)
+
+
+def format_short_suggestions(e: dict | None, max_items: int = 5) -> str:
+    """右侧默认【建议】精简区块：只保留最重要的前 max_items 条（需求 5.1）。"""
+    if not e:
+        return ""
+    items = build_suggestions(e)
+    # 非"无需调整"的实质建议优先；仍保留默认兜底建议
+    items = sorted(items, key=lambda x: 0 if x.startswith("当前设计") else 1)
+    items = items[:max_items]
+    return "【建议】\n" + "\n".join("  • " + x for x in items)

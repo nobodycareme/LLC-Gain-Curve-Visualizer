@@ -144,6 +144,26 @@ def _fmt_freq(hz: float) -> str:
     return f"{hz:.1f} Hz"
 
 
+def _path_y_at(path, x: float):
+    """从 QPainterPath 折线中读取 x 处的插值 Y（当前 Q 曲线的实际渲染像素 Y）。"""
+    n = path.elementCount()
+    prev = None
+    for i in range(n):
+        e = path.elementAt(i)
+        if e.isMoveTo() or e.isLineTo():
+            pt = (e.x, e.y)
+            if prev is not None:
+                x0, y0 = prev
+                x1, y1 = pt
+                if x0 <= x <= x1 or x1 <= x <= x0:
+                    if x1 == x0:
+                        return y1
+                    t = (x - x0) / (x1 - x0)
+                    return y0 + t * (y1 - y0)
+            prev = pt
+    return None
+
+
 _REGION_LABEL = {
     "inductive": "感性区（∠Zin > 0）",
     "capacitive": "容性区（∠Zin < 0）",
@@ -174,6 +194,8 @@ class GainPlotWidget(QWidget):
         self.current_y = [nan] * n
         self.boundary_x: list = []
         self.boundary_y: list = []
+        #: 阻容分界线竖直段（fn=1、M=1→0），见 _compute_boundary
+        self.boundary_vline: tuple = (1.0, 1.0)
 
         # ---- 逐参数缓存 ----
         self.K = float(DEFAULT_K)
@@ -207,9 +229,21 @@ class GainPlotWidget(QWidget):
         # 路径缓存（含其构建键，判断是否需要重建）
         self._fam_paths: list = []
         self._boundary_path: QPainterPath | None = None
+        self._boundary_vline_path: QPainterPath | None = None
         self._cur_path: QPainterPath | None = None
         self._path_rect: QRectF | None = None
         self._path_keys = {"K": None, "Q": None}
+
+        #: 统一几何版本号：任何会改变 plot_rect 的状态（尺寸/图例可见性/ymax/字号）
+        #: 都递增它。所有路径与 pixmap 缓存键必须包含它，杜绝"旧几何路径 + 新几何
+        #: 工作点"的错位（BUG1 根因）。
+        self._geom_gen = 0
+
+        #: 隐藏图层 lazy 重建标记（需求 6.1）：参考 Q / 阻容分界线隐藏时，
+        #: K 拖动期间跳过其显示数据与路径重建，只置 dirty；重新打开或最终刷新时
+        #: 才 lazy rebuild。数学判据（fn_boundary / input_region）不受影响。
+        self._family_dirty = False
+        self._boundary_dirty = False
 
         #: Layer B（当前 Q 曲线 + fnp/fnr/峰值 marker）独立 pixmap。
         #: 只随 Q/K/尺寸/字号变化重建；fn 拖动完全复用，从 repaint 中省掉重画
@@ -246,6 +280,12 @@ class GainPlotWidget(QWidget):
         self.fn_min_band = float("nan")
         self.fn_max_band = float("nan")
 
+        # ---- 拖动 preview 模式（需求 6.4） ----
+        # sliderPressed 置 True：参考族用降采样（~750 点）绘制，当前曲线保持全精度；
+        # sliderReleased 置 False：恢复全精度并做一次最终路径重建。
+        # 数学（M(fn)/peak/fn_boundary/root solve）不受 preview 影响。
+        self._preview = False
+
         # ---- 性能采集（env 开关，默认关闭；供回归/报告用） ----
         self._collect_perf = os.environ.get("LLC_PERF_DETAIL", "") in (
             "1", "true", "on")
@@ -263,10 +303,26 @@ class GainPlotWidget(QWidget):
     # ------------------------------------------------------------------
     # 数学计算（只改列表元素，不增长）
     # ------------------------------------------------------------------
-    def _compute_family(self, k_ratio: float) -> None:
-        for y, q in zip(self.family_y, Q_FAMILY):
-            new = llc_gain_from_parts(self.fn_curve, self.fn2, self.fn2m1, k_ratio, q)
-            y[:] = [float(v) for v in new]
+    def _compute_family(self, k_ratio: float, preview: bool = False) -> None:
+        """参考 Q 曲线族显示数据。
+
+        ``preview=True``（需求 6.4 拖动中）：只算每 4 个采样点（3000→750），
+        其余索引保留旧值（路径按 step=4 只读新算点），把 9 条参考族的增益计算
+        降到约 1/4。数学精度不受影响（峰值/边界/Hover 用精确公式）。
+        """
+        if preview:
+            step = 4
+            n = len(self.fn_curve)
+            for y, q in zip(self.family_y, Q_FAMILY):
+                new = llc_gain_from_parts(
+                    self.fn_curve[::step], self.fn2[::step],
+                    self.fn2m1[::step], k_ratio, q)
+                for j, v in enumerate(new):
+                    y[j * step] = float(v)
+        else:
+            for y, q in zip(self.family_y, Q_FAMILY):
+                new = llc_gain_from_parts(self.fn_curve, self.fn2, self.fn2m1, k_ratio, q)
+                y[:] = [float(v) for v in new]
         self.stats["family"] += 1
         self.rebuild["family_path"] += 1  # 数据变了，路径需重建
         self._base_dirty = True
@@ -281,10 +337,15 @@ class GainPlotWidget(QWidget):
         # 基底 pixmap 不依赖 Q：Q 是否触发基底重建由调用方决定（K 路径置位，Q 路径不置位）
 
     def _compute_boundary(self, k_ratio: float) -> None:
+        """阻容分界线显示数据（∠Zin=0 弯曲段 + fn=1 竖直段）。
+
+        弯曲段从 fnp 起，**准确连接到 (fn=1, M=1)**（不再留 1e-6 缺口，需求 3.2B）；
+        竖直段为 fn=1、M=1→0（需求 3.2C），与弯曲段同风格、同一图例条目。
+        """
         fm0 = fn_parallel(k_ratio)
         step = (1.0 - fm0) / 419
         xs = [fm0 * (1.0 + 1e-6) + step * i for i in range(420)]
-        xs[-1] = 1.0 - 1e-6
+        xs[-1] = 1.0
         ys = boundary_gain(xs, k_ratio)
         if not self.boundary_x:
             self.boundary_x = [float(v) for v in xs]
@@ -292,6 +353,8 @@ class GainPlotWidget(QWidget):
         else:
             self.boundary_x[:] = [float(v) for v in xs]
             self.boundary_y[:] = [float(v) for v in ys]
+        # 竖直段：fn=1，M 从 1 到 0（M=0 即绘图区底边）
+        self.boundary_vline = (1.0, 1.0)
         self.stats["boundary"] += 1
         self.rebuild["boundary_path"] += 1  # 数据变了，路径需重建
         self._base_dirty = True
@@ -324,8 +387,16 @@ class GainPlotWidget(QWidget):
                 self.ymax = float(y_max)
             self.fnp = fn_parallel(self.K)
             self.fnr = fn_series()
-            self._compute_family(self.K)
-            self._compute_boundary(self.K)
+            # 需求 6.1：隐藏图层不持续做显示用重计算，只记录 dirty，等重新打开
+            # 或最终刷新再 lazy rebuild。数学判据（fn_boundary / region）始终计算。
+            if self.show_reference:
+                self._compute_family(self.K, self._preview)
+            else:
+                self._family_dirty = True
+            if self.show_boundary:
+                self._compute_boundary(self.K)
+            else:
+                self._boundary_dirty = True
             self._compute_current(self.K, self.Q)
             self._update_region()
             if was_ylim != self.ymax or ylim:
@@ -402,11 +473,17 @@ class GainPlotWidget(QWidget):
         """
         changed = False
 
-        # 逐项比较并赋值
+        # 逐项比较并赋值；重新打开隐藏图层时 lazy rebuild 其显示数据（需求 6.1）
         if show_reference is not None and bool(show_reference) != self.show_reference:
             self.show_reference = bool(show_reference); changed = True
+            if self.show_reference and self._family_dirty:
+                self._compute_family(self.K)
+                self._family_dirty = False
         if show_boundary is not None and bool(show_boundary) != self.show_boundary:
             self.show_boundary = bool(show_boundary); changed = True
+            if self.show_boundary and self._boundary_dirty:
+                self._compute_boundary(self.K)
+                self._boundary_dirty = False
         if show_m_range is not None and bool(show_m_range) != self.show_m_range:
             self.show_m_range = bool(show_m_range); changed = True
         if show_fn_range is not None and bool(show_fn_range) != self.show_fn_range:
@@ -423,12 +500,37 @@ class GainPlotWidget(QWidget):
             self.fn_max_band = float(fn_max); values_changed = True
 
         if changed or values_changed:
-            # 只重渲染基底（family/boundary/M·fn 带）与图例，不重算数学数据
-            self._base_dirty = True
-            self._invalidate_base_only()
             self._clear_hover_state()
+            if changed:
+                # 图例可见性变化会改变 plot_rect 几何（图例行数→顶部偏移）。
+                # 必须让所有依赖几何的路径/pixmap 失效，否则当前 Q 路径仍按旧几何画，
+                # 而工作点按新几何实时计算 → 错位（BUG1）。只重建像素路径/缓存，
+                # 不重算任何 LLC 数学数据。
+                self._invalidate_geometry()
+                self._invalidate_base_only()
+            else:
+                # 仅 M/fn 范围带数值变化：几何不变，只重画基底带。
+                self._base_dirty = True
             self.update()
         return changed or values_changed
+
+    def set_preview(self, preview: bool) -> None:
+        """拖动 preview 模式（需求 6.4）。
+
+        ``True``：参考族用降采样绘制（见 ``_compute_family`` / ``_ensure_static_paths``），
+        当前曲线保持全精度；``False``：恢复全精度并强制重建参考族路径。
+        只影响显示采样，不重算任何 LLC 数学数据。
+        """
+        preview = bool(preview)
+        if preview == self._preview:
+            return
+        self._preview = preview
+        if not preview:
+            # 退出 preview：路径缓存键含 preview，置空强制按全精度重建
+            self._path_keys["K"] = None
+            self._fam_paths = []
+        self._invalidate_base_only()
+        self.update()
 
     def _invalidate_base_only(self) -> None:
         """只作废基底 pixmap 与图例条带，保留所有数学缓存与路径（值未变）。"""
@@ -437,11 +539,17 @@ class GainPlotWidget(QWidget):
         self._legend_key = None
 
     def _invalidate_geometry(self):
-        """K / 尺寸 / ymax 变化：所有路径、基底与半动态层作废。"""
+        """K / 尺寸 / ymax / 图例可见性变化：所有路径、基底与半动态层作废。
+
+        递增统一几何版本号，确保任何依赖 plot_rect 几何的缓存（当前 Q 路径、
+        semi pixmap、基底）都强制重建，与实时计算的工作点严格对齐（BUG1）。
+        """
+        self._geom_gen += 1
         self._path_rect = None
         self._path_keys = {"K": None, "Q": None}
         self._fam_paths = []
         self._boundary_path = None
+        self._boundary_vline_path = None
         self._cur_path = None
         self._base_key_size = (-1, -1)
         self._base_dirty = True
@@ -504,8 +612,7 @@ class GainPlotWidget(QWidget):
         entries.append((CURRENT_COLOR, 2.6, Qt.SolidLine,
                         f"当前 Q 曲线：Q={self.Q:.4f}"))
         if self.show_boundary:
-            entries.append((BOUNDARY_COLOR, 3.2, Qt.DashLine,
-                            "阻容分界线  ∠Zin = 0"))
+            entries.append((BOUNDARY_COLOR, 3.2, Qt.DashLine, "阻容分界线"))
         entries.append((FNP_COLOR, 1.2, Qt.SolidLine, "fnp（并联谐振）"))
         entries.append((FNR_COLOR, 1.2, Qt.SolidLine, "fnr=1（串联谐振）"))
         entries.append((CURRENT_COLOR, 1.2, Qt.SolidLine, "△ 增益峰值"))
@@ -596,6 +703,22 @@ class GainPlotWidget(QWidget):
         return QRectF(left, top, avail_w, max(20.0, float(h) - top - bottom))
 
     # ------------------------------------------------------------------
+    # 几何缓存键（BUG1）：任何路径/pixmap 缓存键必须包含它
+    # ------------------------------------------------------------------
+    def _geom_key(self, r: QRectF):
+        """几何相关的缓存键前缀：几何版本 + 绘图区 rect。
+
+        所有依赖坐标映射的缓存（当前 Q 路径 / semi pixmap / 参考族 / 边界路径 /
+        显示采样）都必须用本键（或其矩形字段）做键的一部分，从而**无需依赖手动
+        失效**：只要 plot_rect 的几何（含图例可见性导致的顶部偏移）有任何变化，
+        缓存键就必然不同，杜绝"旧几何曲线 + 新几何工作点"的错位（BUG1 根因）。
+
+        K/Q 不含在内：它们是"数学键"，与"几何键"分开（见需求 6.5）。
+        """
+        return (self._geom_gen, round(r.left(), 3), round(r.top(), 3),
+                round(r.width(), 3), round(r.height(), 3), round(self.ymax, 4))
+
+    # ------------------------------------------------------------------
     # 曲线路径构建（一次构建，供基底渲染与 PNG 复用）
     # ------------------------------------------------------------------
     def _render_step(self, total: int) -> int:
@@ -615,7 +738,7 @@ class GainPlotWidget(QWidget):
         同一 rect + step 下，fn_curve 上所有曲线（家族/当前）的像素 X 完全一致，
         只算一次。``step=1``（边界用 boundary_x 走各自路径）除外。
         """
-        key = (r.left(), r.top(), r.width(), r.height(), step)
+        key = self._geom_key(r) + (step,)
         if self._disp_idx and self._disp_key == key:
             return self._disp_idx, self._disp_px
         lo = math.log10(FN_MIN)
@@ -681,35 +804,86 @@ class GainPlotWidget(QWidget):
                 path.lineTo(px, py)
         return path
 
-    def _ensure_static_paths(self, r: QRectF):
-        """Layer A 路径：参考族 + 阻容边界（按 K + rect 缓存；Q 不触发重建）。"""
-        key = (self.K, r.left(), r.top(), r.width(), r.height())
+    def _build_boundary_extras(self, r: QRectF) -> None:
+        """构建阻容分界线竖直段路径（fn=1、M=1→0）。
+
+        与弯曲段同风格（同一 pen 绘制，见 ``_draw_boundary``），不新增图例条目。
+        竖直段不是单值函数 M(fn)，故单独存路径，Hover 用独立几何 hit test
+        （需求 3.4），绝不伪造 ``boundary_gain(1)``。
+        """
+        x = self._map_x(1.0, r)
+        y_top = self._map_y_full(1.0, r)
+        y_bot = self._map_y_full(0.0, r)
+        path = QPainterPath()
+        path.moveTo(x, y_top)
+        path.lineTo(x, y_bot)
+        self._boundary_vline_path = path
+
+    def _ensure_static_paths(self, r: QRectF, preview: bool = False):
+        """Layer A 路径：参考族 + 阻容边界（按 K + rect 缓存；Q 不触发重建）。
+
+        需求 6.1：隐藏图层（show_reference / show_boundary 为 False）不构建其
+        显示路径，K 拖动期间省去 9 条参考族 + 边界路径的重建成本；重新打开时
+        由 ``set_display_state`` 触发 lazy rebuild。
+        需求 6.4：``preview=True`` 时参考族路径按 step=4 降采样（~750 点），
+        与 ``_compute_family(preview=True)`` 写入的稀疏点严格对应。
+        """
+        key = (self.K, preview) + self._geom_key(r)
         if self._path_rect != r or self._path_keys["K"] != key:
-            step = self._render_step(len(self.fn_curve))
+            step = 4 if preview else self._render_step(len(self.fn_curve))
             disp = self._display_sample(r, step)
-            self._fam_paths = [self._build_curve_path(self.fn_curve, y, r, step, disp)
-                               for y in self.family_y]
-            self._boundary_path = self._build_curve_path(
-                self.boundary_x, self.boundary_y, r, 1)
+            if self.show_reference:
+                self._fam_paths = [self._build_curve_path(
+                    self.fn_curve, y, r, step, disp) for y in self.family_y]
+            else:
+                self._fam_paths = []
+            if self.show_boundary:
+                self._boundary_path = self._build_curve_path(
+                    self.boundary_x, self.boundary_y, r, 1)
+                self._build_boundary_extras(r)
+            else:
+                self._boundary_path = None
+                self._boundary_vline_path = None
             self._path_keys["K"] = key
             self._path_rect = r
-        if self._cur_path is None:
+        if self._cur_path is None or self._path_keys["Q"] != (self.Q, self.K) + self._geom_key(r):
             step = self._render_step(len(self.fn_curve))
             disp = self._display_sample(r, step)
             self._cur_path = self._build_curve_path(
                 self.fn_curve, self.current_y, r, step, disp)
-            self._path_keys["Q"] = (self.Q, self.K)
+            self._path_keys["Q"] = (self.Q, self.K) + self._geom_key(r)
         return self._fam_paths, self._boundary_path
 
     def _ensure_current_path(self, r: QRectF) -> QPainterPath:
-        """Layer B 路径：当前 Q 曲线（按 Q+K+rect 缓存，Q 变化时只重建它）。"""
-        if self._path_keys["Q"] != (self.Q, self.K):
+        """Layer B 路径：当前 Q 曲线（按 Q+K+几何 缓存，Q 变化时只重建它）。"""
+        key = (self.Q, self.K) + self._geom_key(r)
+        if self._path_keys["Q"] != key:
             step = self._render_step(len(self.fn_curve))
             disp = self._display_sample(r, step)
             self._cur_path = self._build_curve_path(
                 self.fn_curve, self.current_y, r, step, disp)
-            self._path_keys["Q"] = (self.Q, self.K)
+            self._path_keys["Q"] = key
         return self._cur_path
+
+    def workpoint_on_current_curve_px(self) -> float:
+        """工作点中心与当前 Q 曲线在同一 fn 下的像素 Y 差（需求 1 验收）。
+
+        用当前绘图区几何重建/复用已缓存当前曲线路径，读取工作点 fn 处的插值
+        渲染像素 Y，与工作点增益的映射像素 Y 求差的绝对值。当工作点增益落在
+        可视区 ``(0, ymax]`` 之外（曲线被裁剪、点被夹取到边缘）时无意义，
+        返回 ``math.inf`` 由调用方自行跳过。仅重建像素路径，不重算任何数学数据。
+        """
+        r = self._plot_rect(self.width(), self.height())
+        cur = self._ensure_current_path(r)
+        mwork = float(llc_gain(self.fn_work, self.K, self.Q))
+        if not (0.0 < mwork <= self.ymax):
+            return math.inf
+        x_fn = self._map_x(self.fn_work, r)
+        y_path = _path_y_at(cur, x_fn)
+        if y_path is None:
+            return math.inf
+        y_wp = self._map_y(mwork, r)
+        return abs(y_path - y_wp)
 
     # ------------------------------------------------------------------
     # 基底（Layer A + B）渲染
@@ -769,7 +943,7 @@ class GainPlotWidget(QWidget):
         if bd is not None:
             p.drawPixmap(0, 0, bd)
         # 网格已画入 backdrop；这里补画 K 依赖的内容
-        fam, bnd = self._ensure_static_paths(r)
+        fam, bnd = self._ensure_static_paths(r, self._preview)
         self._draw_family(p, r, fam)
         self._draw_boundary(p, r, bnd)
         self._draw_m_band(p, r)      # M 范围带（显示层）
@@ -808,21 +982,24 @@ class GainPlotWidget(QWidget):
     def _draw_boundary(self, p: QPainter, r: QRectF, bnd) -> None:
         if not self.show_boundary:       # 隐藏层不绘制（见需求八/二十八）
             return
-        if bnd is None or bnd.isEmpty():
-            return
         p.save()
         pen = QPen(_hex(BOUNDARY_COLOR), 3.2)
         pen.setStyle(Qt.DashLine)
         pen.setDashPattern([10.0, 4.0])
         p.setPen(pen)
         p.setClipRect(r)
-        p.drawPath(bnd)
+        if bnd is not None and not bnd.isEmpty():
+            p.drawPath(bnd)
+        # 竖直段（fn=1、M=1→0）：与弯曲段同一 pen，不新增图例条目（需求 3.2C）
+        vp = self._boundary_vline_path
+        if vp is not None and not vp.isEmpty():
+            p.drawPath(vp)
         p.restore()
         # 线旁标注（跟随 K 自动调整，尽量避开峰值区）
         self._draw_boundary_label(p, r, bnd)
 
     def _draw_boundary_label(self, p: QPainter, r: QRectF, bnd) -> None:
-        """在阻容分界线上方绘制 <阻容分界 ∠Zin=0> 小标签。"""
+        """在阻容分界线上方绘制 <阻容分界线> 小标签（名称不含 ∠Zin=0，需求 3.1）。"""
         fn_lab = 0.9
         if not (FN_MIN < fn_lab <= 1.0):
             return
@@ -837,7 +1014,7 @@ class GainPlotWidget(QWidget):
         p.save()
         p.setFont(font)
         met = QFontMetrics(font)
-        label = "阻容分界  ∠Zin=0"
+        label = "阻容分界线"
         tw = met.horizontalAdvance(label)
         th = met.height()
         pad = 3
@@ -1076,9 +1253,13 @@ class GainPlotWidget(QWidget):
     _legend_key = None
 
     def _ensure_legend_strip(self, w: int, h: int) -> QPixmap | None:
-        """图例条带独立 pixmap：只在 Q/K/尺寸/布局变化时重建。"""
+        """图例条带独立 pixmap：只在 Q/尺寸/布局变化时重建。
+
+        图例文本只依赖 Q（"当前 Q 曲线"条目）与布局，不依赖 K；K 拖动时复用，
+        避免每帧重建图例条带（需求 6）。
+        """
         lay, cell_w, total_w, total_h = self._legend_strip_geometry(w, h)
-        key = (int(w), int(h), round(self.Q, 6), round(self.K, 6), lay["cols"])
+        key = (int(w), int(h), round(self.Q, 6), lay["cols"])
         if self._legend_pixmap is not None and self._legend_key == key:
             return self._legend_pixmap
         dpr = self.devicePixelRatioF()
@@ -1167,8 +1348,12 @@ class GainPlotWidget(QWidget):
     def _ensure_backdrop(self) -> QPixmap | None:
         """不随 K 变化的背景层（白底+网格+坐标轴+刻度文字），独立缓存。
 
-        只按 widget 尺寸 / ymax / DPR / 字号重建。K/Q/fn 变化均完全复用，
-        是 K 拖动"不重画网格与文字"的关键。
+        只按 widget 尺寸 / ymax / DPR / 字号 / **绘图区几何**重建。K/Q/fn 变化均
+        完全复用，是 K 拖动"不重画网格与文字"的关键。
+
+        注意：缓存键用绘图区 rect 几何（而非 ``_geom_gen``），这样图例可见性变化
+        （改变 plot_rect 顶部偏移）会触发重建（BUG1），而纯 K 拖动不改变 plot_rect，
+        背景层被复用，避免 K 拖动每帧重画网格/刻度文字（需求 6）。
         """
         w = int(self.width())
         h = int(self.height())
@@ -1176,7 +1361,10 @@ class GainPlotWidget(QWidget):
             return None
         dpr = self.devicePixelRatioF()
         scale = self.height()
-        key = (w, h, round(self.ymax, 4), round(dpr, 4), int(scale))
+        r = self._plot_rect(w, h)
+        key = (w, h, round(self.ymax, 4), round(dpr, 4), int(scale),
+               round(r.left(), 3), round(r.top(), 3),
+               round(r.width(), 3), round(r.height(), 3))
         if (self._backdrop_pixmap is not None
                 and self._backdrop_key == key):
             return self._backdrop_pixmap
@@ -1186,7 +1374,6 @@ class GainPlotWidget(QWidget):
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setRenderHint(QPainter.TextAntialiasing, True)
-        r = self._plot_rect(w, h)
         self._draw_background(p, r)
         self._draw_grid(p, r)
         self._draw_axes(p, r)
@@ -1234,7 +1421,7 @@ class GainPlotWidget(QWidget):
         h = int(self.height())
         if w <= 4 or h <= 4:
             return None
-        key = (w, h, round(self.Q, 6), round(self.K, 6))
+        key = self._geom_key(r) + (round(self.Q, 6), round(self.K, 6))
         if self._semi_pixmap is not None and self._semi_key == key:
             return self._semi_pixmap
         dpr = self.devicePixelRatioF()
@@ -1301,6 +1488,33 @@ class GainPlotWidget(QWidget):
             return m
         return float(llc_gain(fn_mouse, self.K, q))
 
+    def _vertical_boundary_hit(self, screen_x: float, screen_y: float,
+                               r: QRectF, tol: float):
+        """阻容分界线竖直段（fn=1、M=1→0）的独立几何 hit test（需求 3.4）。
+
+        竖直段不是单值函数 M(fn)，不能用 ``boundary_gain`` 表示；这里直接判断
+        鼠标到 x(fn=1) 的像素距离，且 mouse_y 必须落在 M=0~1 对应像素范围内。
+        命中时反算 M（鼠标 y 对应值，∈[0,1]），绝不伪造 ``boundary_gain(1)``。
+        """
+        if not self.show_boundary:
+            return None
+        x1 = self._map_x(1.0, r)
+        y_top = self._map_y_full(1.0, r)   # M=1 的像素 y
+        y_bot = self._map_y_full(0.0, r)   # M=0 的像素 y（= 绘图区底边）
+        if not (y_top - tol <= screen_y <= y_bot + tol):
+            return None
+        if abs(screen_x - x1) > tol:
+            return None
+        span = (y_bot - y_top) or 1.0
+        m_est = max(0.0, min(1.0, (y_bot - screen_y) / span))
+        return {
+            "kind": "boundary", "q": None, "color": BOUNDARY_COLOR,
+            "fn": 1.0, "m": m_est,
+            "screen_x": x1, "screen_y": screen_y,
+            "dist": abs(screen_x - x1), "priority": _HOVER_PRIORITY["boundary"],
+            "qb": None, "mb": m_est,
+        }
+
     def hit_test(self, screen_x: float, screen_y: float, plot_rect: QRectF = None):
         """命中检测：纯数学 + 像素距离，O(候选数) 复杂度。
 
@@ -1338,13 +1552,22 @@ class GainPlotWidget(QWidget):
                     "dist": dist, "priority": prio,
                     "qb": None, "mb": None,
                 }
+        # 竖直边界段候选（fn=1、M=1→0，需求 3.4）：与弯曲段/曲线候选统一比距离
+        vhit = self._vertical_boundary_hit(screen_x, screen_y, r, tol)
+        if vhit is not None:
+            if best is None or vhit["dist"] < best["dist"] - 1e-9 or (
+                    abs(vhit["dist"] - best["dist"]) <= 1e-9
+                    and vhit["priority"] < best["priority"]):
+                best = vhit
         if best is None:
             return None
         # 补充边界量 / 区域
         best["region"] = input_region(fn_mouse, self.K, self.Q)
         if best["kind"] == "boundary":
-            best["mb"] = boundary_gain(fn_mouse, self.K)
-            best["qb"] = q_boundary_for_fn(fn_mouse, self.K)
+            if best.get("mb") is None:
+                # 弯曲段：按 fn_mouse 精确计算；竖直段已自带反算 mb，不覆盖
+                best["mb"] = boundary_gain(fn_mouse, self.K)
+                best["qb"] = q_boundary_for_fn(fn_mouse, self.K)
         return best
 
     def _tooltip_lines(self, hit) -> list:
@@ -1486,7 +1709,7 @@ class GainPlotWidget(QWidget):
         self._draw_grid(p, r)
         self._draw_axes(p, r)
         self._draw_labels(p, r)
-        fam, bnd = self._ensure_static_paths(r)
+        fam, bnd = self._ensure_static_paths(r, preview=False)  # 导出恒全精度
         self._draw_family(p, r, fam)
         self._draw_boundary(p, r, bnd)
         self._draw_resonance_vlines(p, r)

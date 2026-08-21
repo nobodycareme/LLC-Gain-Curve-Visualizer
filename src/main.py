@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (  # noqa: E402
     QPlainTextEdit,
     QSizePolicy,
     QSlider,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -73,7 +74,6 @@ from llc_py import (  # noqa: E402
     K_MIN,
     Q_MAX,
     Q_MIN,
-    format_result_text,
 )
 # ---- 工程设计数学层（Phase 2/3/4 产物，见需求 14~23） ----
 from llc_design import (  # noqa: E402
@@ -89,22 +89,25 @@ from llc_stress import (  # noqa: E402
     secondary_currents,
 )
 from llc_report import (  # noqa: E402
-    build_analysis,
-    build_suggestions,
-    format_design_results,
-    format_stress_results,
+    format_key_results,
+    format_detail_results,
+    format_short_analysis,
+    format_short_suggestions,
 )
 
 APP_TITLE = "LLC 谐振变换器交互式多增益曲线"
 
 # ---- 工程设计默认值（Phase 6） ----
 # 次级整流形式 -> 内部键（ct_diode/ct_sr/fb_diode/fb_sr）
+# 显示文本为中文；内部键保持英文，中文化不影响计算逻辑（需求 2）
 RECT_OPTIONS = [
-    ("Center Tap diode", "ct_diode"),
-    ("Center Tap SR", "ct_sr"),
-    ("Full Bridge diode", "fb_diode"),
-    ("Full Bridge SR", "fb_sr"),
+    ("中心抽头二极管整流", "ct_diode"),
+    ("中心抽头同步整流", "ct_sr"),
+    ("全桥二极管整流", "fb_diode"),
+    ("全桥同步整流", "fb_sr"),
 ]
+#: 拓扑显示文本（内部键 half/full 不变，需求 2）
+BRIDGE_OPTIONS = [("半桥", "half"), ("全桥", "full")]
 #: 过载倍率选项（显示标签 -> 倍率）
 OVERLOAD_OPTIONS = [("100%", 1.0), ("110%", 1.1), ("120%", 1.2)]
 DEFAULT_VIN_MIN, DEFAULT_VIN_NOM, DEFAULT_VIN_MAX = 300.0, 390.0, 480.0
@@ -116,6 +119,14 @@ SLIDER_STEPS = 1000
 
 #: 拖动期间刷新合并间隔（毫秒）。16 ms ≈ 60 FPS；33 ms ≈ 30 FPS。
 REFRESH_MS = 16
+
+#: 工程参数键盘输入自动提交 debounce（毫秒，需求 4）：停止输入一段时间后
+#: interpretText → 校验 → 全部有效才 commit → 自动重新计算。
+ENG_DEBOUNCE_MS = 300
+
+#: 拖动期间完整工程结果/长文本节流刷新间隔（毫秒，需求 5.3/6.2）：
+#: 拖动时曲线实时更新，完整工程计算与结果文本按此频率刷新，松手立即最终刷新。
+RESULT_THROTTLE_MS = 120
 
 #: 环境变量或命令行开关：开启性能日志（默认关闭）
 PERF_LOG_ENV = "LLC_PERF_LOG"
@@ -227,6 +238,21 @@ class MainWindow(QMainWindow):
         self._updating = False          # 回调重入锁
         self._pending = False
 
+        # ---- 拖动节流状态（需求 5.3 / 6.2 / 6.3） ----
+        self._dragging = False          # 滑块拖动中：曲线实时、工程/长文本降频
+        self._engine_pending = False    # 拖动中需要重算工程（交给节流/松手刷新）
+        self._result_timer = QTimer(self)
+        self._result_timer.setSingleShot(True)
+        self._result_timer.setInterval(RESULT_THROTTLE_MS)
+        self._result_timer.timeout.connect(self._on_result_timer)
+
+        # ---- 工程参数键盘输入自动提交（需求 4） ----
+        self._eng_debounce = QTimer(self)
+        self._eng_debounce.setSingleShot(True)
+        self._eng_debounce.setInterval(ENG_DEBOUNCE_MS)
+        self._eng_debounce.timeout.connect(self._on_eng_debounce)
+        self._eng_debounce_sender = None
+
         # ---- 工程设计事务式状态（Phase 6，需求二十六） ----
         self._engine_dirty = True       # 工程设计输入变化需要重算
         self._engine_ok = False         # 最近一次工程设计是否有效
@@ -311,6 +337,9 @@ class MainWindow(QMainWindow):
         self.canvas.setMinimumHeight(420)
         upper.addWidget(self.canvas, stretch=3)
 
+        # 右侧：默认【关键结果】精简区 + 可展开"详细信息"（需求 5.1）
+        right_col = QVBoxLayout()
+        right_col.setSpacing(3)
         self.resultBox = QPlainTextEdit()
         self.resultBox.setReadOnly(True)
         self.resultBox.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -319,7 +348,29 @@ class MainWindow(QMainWindow):
         self.resultBox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         mono = QFont(qt_font_family() or "Consolas", 10)
         self.resultBox.setFont(mono)
-        upper.addWidget(self.resultBox, stretch=1)
+        right_col.addWidget(self.resultBox, stretch=1)
+
+        self.detailToggle = QToolButton()
+        self.detailToggle.setText("详细信息 ▼")
+        self.detailToggle.setCheckable(True)
+        self.detailToggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.detailToggle.setAutoRaise(True)
+        self.detailToggle.setStyleSheet("text-align:left; color:#555;")
+        self.detailToggle.toggled.connect(self._on_detail_toggle)
+        right_col.addWidget(self.detailToggle, stretch=0)
+
+        self.detailBox = QPlainTextEdit()
+        self.detailBox.setReadOnly(True)
+        self.detailBox.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.detailBox.setMinimumWidth(330)
+        self.detailBox.setMaximumWidth(430)
+        self.detailBox.setMinimumHeight(120)
+        self.detailBox.setMaximumHeight(280)
+        self.detailBox.setFont(mono)
+        self.detailBox.setVisible(False)
+        right_col.addWidget(self.detailBox, stretch=0)
+
+        upper.addLayout(right_col, stretch=1)
 
         root.addLayout(upper, stretch=1)
 
@@ -453,13 +504,13 @@ class MainWindow(QMainWindow):
         # 行 2：拓扑 / 整流
         egrid.addWidget(QLabel("拓扑"), r, 0)
         self.comboBridge = QComboBox()
-        self.comboBridge.addItems(["Half Bridge", "Full Bridge"])
+        self.comboBridge.addItems([t for t, _ in BRIDGE_OPTIONS])
         self.comboBridge.setCurrentIndex(0)
         egrid.addWidget(self.comboBridge, r, 1)
         egrid.addWidget(QLabel("次级整流"), r, 2)
         self.comboRect = QComboBox()
         self.comboRect.addItems([t for t, _ in RECT_OPTIONS])
-        self.comboRect.setCurrentIndex(1)   # Center Tap SR
+        self.comboRect.setCurrentIndex(1)   # 中心抽头同步整流
         egrid.addWidget(self.comboRect, r, 3, 1, 3)
         r += 1
 
@@ -491,6 +542,12 @@ class MainWindow(QMainWindow):
         self.comboOverload.addItems([t for t, _ in OVERLOAD_OPTIONS])
         self.comboOverload.setCurrentIndex(1)   # 110%
         egrid.addWidget(self.comboOverload, r, 5)
+        r += 1
+
+        # 行 5：键盘输入自动应用状态（需求 4，轻量提示）
+        self.engStatusLabel = QLabel("")
+        self.engStatusLabel.setStyleSheet("color:#888; font-size:9pt;")
+        egrid.addWidget(self.engStatusLabel, r, 0, 1, 6)
         eng_row.addWidget(eng_panel, stretch=1)
 
         # --- 显示选项面板（Phase 8，需求四） ---
@@ -501,7 +558,7 @@ class MainWindow(QMainWindow):
         dbox.setSpacing(4)
         self.cbRefQ = QCheckBox("预设参考 Q 曲线")
         self.cbRefQ.setChecked(True)
-        self.cbBoundary = QCheckBox("阻容分界线 ∠Zin=0")
+        self.cbBoundary = QCheckBox("阻容分界线")
         self.cbBoundary.setChecked(True)
         self.cbMRange = QCheckBox("Mmin ~ Mmax 范围")
         self.cbMRange.setChecked(False)
@@ -530,12 +587,20 @@ class MainWindow(QMainWindow):
         self.sliderK.sliderReleased.connect(self._on_released)
         self.sliderQ.sliderReleased.connect(self._on_released)
         self.sliderFn.sliderReleased.connect(self._on_released)
+        # 按下时进入拖动节流模式（需求 5.3 / 6.2）
+        self.sliderK.sliderPressed.connect(self._on_slider_pressed)
+        self.sliderQ.sliderPressed.connect(self._on_slider_pressed)
+        self.sliderFn.sliderPressed.connect(self._on_slider_pressed)
 
         # ---------- 工程设计参数信号（Phase 6，事务式） ----------
         for w in (self.spinVinMin, self.spinVinNom, self.spinVinMax,
                   self.spinVo, self.spinPout, self.spinIo,
                   self.spinN, self.spinEta, self.spinVdrop):
             w.valueChanged.connect(self._on_eng_spin)
+            # 键盘输入自动提交（需求 4）：textEdited 启动 debounce，
+            # editingFinished（Enter/失焦）立即提交。
+            w.lineEdit().textEdited.connect(self._on_eng_text_edited)
+            w.editingFinished.connect(self._on_eng_editing_finished)
         self.comboBridge.currentIndexChanged.connect(self._on_eng_changed)
         self.comboRect.currentIndexChanged.connect(self._on_eng_changed)
         self.comboTurn.currentIndexChanged.connect(self._on_turn_changed)
@@ -573,18 +638,34 @@ class MainWindow(QMainWindow):
         self.dirty_ylim = True
         self._schedule_refresh()
 
+    def _on_slider_pressed(self, *_):
+        """滑块按下：进入拖动节流模式（需求 5.3 / 6.2）+ 参考族 preview 采样（需求 6.4）。
+
+        拖动期间曲线/顶部状态实时更新；完整工程计算与长结果文本按
+        ``RESULT_THROTTLE_MS`` 节流，松手时立即最终刷新。
+        """
+        self._dragging = True
+        self.plot.set_preview(True)
+
+    def _on_result_timer(self):
+        """拖动节流计时器：做一次完整工程计算 + 长结果文本刷新。"""
+        self._do_update(force_full=True)
+
     def _on_released(self, *_):
-        """滑块释放：只冲刷尚未 flush 的最后一个值，不做全量 dirty 重算。
+        """滑块释放：退出拖动节流，立即做一次全量最终刷新。
 
         拖动期间 valueChanged 已把最新目标参数写入各自 dirty flag；若最后一个
         valueChanged 还未被合并计时器 flush，这里补一次；若已 flush，则各 dirty
         均为 False，执行一次极轻量的纯文本/元数据刷新即可。绝不在这里全量重算
         曲线族，避免"松手顿一下"。
         """
+        self._dragging = False
+        self.plot.set_preview(False)
+        self._result_timer.stop()
         if self._perf_log and self._perf:
             self._dump_perf()
         self._refresh_timer.stop()
-        self._do_update()
+        self._do_update(force_full=True)
 
     # ------------------------------------------------------------------
     # 工程设计/显示回调（Phase 6/8）
@@ -618,6 +699,57 @@ class MainWindow(QMainWindow):
     def _on_eng_changed(self, *_):
         self._engine_dirty = True
         self._schedule_refresh()
+
+    # ---- 键盘输入自动提交（需求 4） ----
+    def _on_eng_text_edited(self, *_):
+        """键盘输入中：显示"未完成"状态并启动 debounce。
+
+        ``setKeyboardTracking(False)`` 下 valueChanged 只在失焦/Enter 才触发；
+        这里用 lineEdit.textEdited 感知键盘编辑，停止输入一段时间后自动提交，
+        无需再点击其他输入框。
+        """
+        le = self.sender()
+        sb = le.parent() if le is not None else None
+        self._eng_debounce_sender = sb
+        self._set_eng_status("参数有未完成输入")
+        self._eng_debounce.start()
+
+    def _on_eng_debounce(self):
+        """停止输入一段时间后：interpretText → 校验 → 自动提交。
+
+        ``interpretText()`` 会把当前文本解析为数值；若值变化会自动触发
+        ``valueChanged`` → ``_on_eng_spin`` → 事务式校验 → 重新计算。
+        输入尚未完成或暂时非法时，事务式校验保留上一套有效结果，不覆盖。
+        """
+        sb = self._eng_debounce_sender
+        self._eng_debounce_sender = None
+        if sb is not None:
+            sb.interpretText()
+        self._set_eng_status("已自动应用")
+
+    def _on_eng_editing_finished(self, *_):
+        """Enter / 失焦：立即提交，不等 debounce。
+
+        ``setKeyboardTracking(False)`` 下 valueChanged 只在失焦/Enter 才触发；
+        这里显式 ``interpretText()`` 把当前文本解析为数值（若变化会触发
+        ``valueChanged`` → ``_on_eng_spin`` → 事务式校验 → 重新计算），
+        保证 Enter 立即生效、无需再点其他输入框（需求 4）。
+        """
+        self._eng_debounce.stop()
+        sb = self.sender() or self._eng_debounce_sender
+        self._eng_debounce_sender = None
+        if sb is not None:
+            sb.interpretText()
+        self._set_eng_status("已自动应用")
+
+    def _set_eng_status(self, text: str) -> None:
+        if hasattr(self, "engStatusLabel"):
+            self.engStatusLabel.setText(text)
+
+    def _on_detail_toggle(self, checked: bool) -> None:
+        """详细信息展开/折叠（需求 5.1）。"""
+        self.detailBox.setVisible(checked)
+        self.detailToggle.setText("详细信息 ▲" if checked else "详细信息 ▼")
 
     def _on_turn_changed(self, *_):
         self._apply_turn_enabled()
@@ -659,14 +791,19 @@ class MainWindow(QMainWindow):
     def _flush_refresh(self):
         self._do_update()
 
-    def _do_update(self):
-        """同步执行一次刷新（也用于滑块释放、初始和测试）。"""
+    def _do_update(self, force_full: bool = False):
+        """同步执行一次刷新（也用于滑块释放、初始和测试）。
+
+        ``force_full``：拖动节流期间（``self._dragging``）默认只做轻量更新
+        （曲线/顶部状态/数值标签），完整工程计算与长结果文本交给
+        ``_result_timer`` 或滑块释放时的最终刷新（需求 5.3 / 6.2 / 6.3）。
+        """
         if self._updating:
             self._pending = True
             return
         self._updating = True
         try:
-            self._apply_update()
+            self._apply_update(force_full=force_full)
         except Exception as exc:
             self._show_error(exc)
         finally:
@@ -711,7 +848,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 核心刷新逻辑：按 dirty flag 增量计算，只更新数据
     # ------------------------------------------------------------------
-    def _apply_update(self) -> None:
+    def _apply_update(self, force_full: bool = False) -> None:
         k_ratio, q_cur, fn_work, fr_khz, y_max = self._read_params()
 
         # 依据 dirty 组合决定 refresh 的增量参数
@@ -742,9 +879,16 @@ class MainWindow(QMainWindow):
 
         # ---- 工程设计与应力（事务式：需求二十六；显示/数学状态分离：需求二十七） ----
         # 只有 K/Q/fr 或工程输入变化才重算设计层，纯 fn 拖动零重算。
-        if self._engine_dirty or k or q or fr:
-            self._engine_dirty = False
-            self._recompute_engine(k_ratio, q_cur, fr_khz)
+        # 拖动节流（需求 6.2）：拖动期间只记录 pending，完整工程计算交给
+        # _result_timer（约 8 FPS）或滑块释放时的最终刷新。
+        if self._dragging and not force_full:
+            if self._engine_dirty or k or q or fr:
+                self._engine_pending = True
+        else:
+            if self._engine_dirty or k or q or fr or self._engine_pending:
+                self._engine_dirty = False
+                self._engine_pending = False
+                self._recompute_engine(k_ratio, q_cur, fr_khz)
         self._apply_eng_availability()
 
         # 数值标签
@@ -752,29 +896,21 @@ class MainWindow(QMainWindow):
         self.labelQ.setText(f"{q_cur:.4f}")
         self.labelFn.setText(f"{fn_work:.4f}")
 
-        # 顶部标题状态栏：固定标题 + 动态参数
+        # 顶部标题状态栏：固定标题 + 动态参数（含 M(fn)，拖动时实时更新）
         self.statusLabel.setText(
             f"K={k_ratio:.4f}    Q={q_cur:.4f}    fn={fn_work:.4f}"
+            f"    M(fn)={values.get('Mfn', float('nan')):.4f}"
             f"    fs={fn_work * fr_khz:.3f} kHz"
             f"    fr={fr_khz:.3f} kHz"
         )
 
-        # 右侧结果区：工作点（保持原格式，零回退）+ 工程设计/应力/分析/建议
-        text = format_result_text(values)
-        if self._engine_ok and self._engine and self._stress:
-            text += "\n\n" + format_design_results(self._engine)
-            text += "\n\n" + format_stress_results(self._stress)
-            text += "\n\n【分析】\n" + "\n".join(
-                "  " + flag + " " + msg
-                for flag, msg in build_analysis(self._engine, self._stress))
-            text += "\n\n【建议】\n" + "\n".join(
-                "  • " + s_ for s_ in build_suggestions(self._engine))
-        elif self._engine_error:
-            text += "\n\n⚠ 工程参数无效：{:}\n（已保留上一套有效结果，输入会标红提示）".format(
-                self._engine_error)
-        if text != self._last_applied:
-            self.resultBox.setPlainText(text)
-            self._last_applied = text
+        # ---- 右侧结果区（需求 5.1 / 5.2 / 5.3 / 6.3） ----
+        if self._dragging and not force_full:
+            # 拖动中：不每帧重建长文本；交给 _result_timer 节流刷新。
+            if not self._result_timer.isActive():
+                self._result_timer.start()
+        else:
+            self._update_result_text(values)
 
         # 记录刷新耗时
         draw_stamp = None
@@ -788,6 +924,53 @@ class MainWindow(QMainWindow):
             import time as _time
             self._perf["draw_sum"] += (_time.perf_counter() - draw_stamp) * 1000.0
             self._perf["frames"] += 1
+
+    # ------------------------------------------------------------------
+    # 右侧结果文本（需求 5.1 分层 + 5.2 滚动位置保持）
+    # ------------------------------------------------------------------
+    def _snapshot_result_scroll(self) -> dict:
+        vsb = self.resultBox.verticalScrollBar()
+        hsb = self.resultBox.horizontalScrollBar()
+        return {
+            "v": vsb.value(),
+            "at_bottom": vsb.maximum() > 0 and vsb.value() >= vsb.maximum() - 1,
+            "h": hsb.value(),
+        }
+
+    def _restore_result_scroll(self, snap: dict) -> None:
+        vsb = self.resultBox.verticalScrollBar()
+        hsb = self.resultBox.horizontalScrollBar()
+        if snap["at_bottom"]:
+            vsb.setValue(vsb.maximum())
+        else:
+            vsb.setValue(min(snap["v"], vsb.maximum()))
+        hsb.setValue(min(snap["h"], hsb.maximum()))
+
+    def _set_result_text(self, box: QPlainTextEdit, text: str) -> None:
+        """设置文本并保持滚动位置（需求 5.2）：不因参数变化跳回顶部。"""
+        snap = self._snapshot_result_scroll() if box is self.resultBox else None
+        box.setPlainText(text)
+        if snap is not None:
+            self._restore_result_scroll(snap)
+
+    def _update_result_text(self, values: dict) -> None:
+        """默认【关键结果】精简区 + 精简分析/建议；详细信息在可展开区。"""
+        text = format_key_results(values, self._engine, self._stress)
+        if self._engine_ok and self._engine and self._stress:
+            text += "\n\n" + format_short_analysis(self._engine, self._stress)
+            text += "\n\n" + format_short_suggestions(self._engine)
+        elif self._engine_error:
+            text += "\n\n⚠ 工程参数无效：{:}\n（已保留上一套有效结果，输入会标红提示）".format(
+                self._engine_error)
+        if text != self._last_applied:
+            self._set_result_text(self.resultBox, text)
+            self._last_applied = text
+        # 详细信息区（若已展开）同步刷新：以开关状态为准（isVisible 依赖窗口显示，
+        # 离屏测试/未 show 时不可靠）
+        if self.detailToggle.isChecked():
+            self._set_result_text(
+                self.detailBox,
+                format_detail_results(values, self._engine, self._stress))
 
     def _clear_dirty(self):
         self.dirty_k = False

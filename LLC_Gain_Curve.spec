@@ -71,16 +71,52 @@ a = Analysis(
     noarchive=False,
 )
 
-# 剔除 Qt 软件 OpenGL 回退库。本程序纯 QPainter 栅格绘制，从不触发
-# OpenGL 上下文，此 20MB 库为无关依赖。按文件名定向剔除（不手工删 DLL，
-# 而是让构建流程确定地排除；若未来某平台需要，移除该过滤即可恢复）。
-a.binaries = [b for b in a.binaries
-              if os.path.basename(b[0]).lower() not in {
-                  "opengl32sw.dll",
-                  "libEGL.dll",
-                  "libGLESv2.dll",
-                  "d3dcompiler_47.dll",
-              }]
+# 定向剔除本程序运行完全不需要的 Qt 插件与库（需求 7 瘦身）。
+# 依据：程序仅用 QtCore/QtGui/QtWidgets + QPainter 栅格绘制，
+# 无网络 / 无 SVG / 无图片文件加载 / 无 QTranslator / 无 OpenGL。
+# 每类都经"构建→启动→操作 GUI→导出 PNG→自动测试"验证。
+# 注意：按目标路径（b[0]）定向剔除，不手工删 DLL，构建流程确定可复现。
+_BIN_DROP = {
+    # 网络：由 generic/qtuiotouchplugin.dll 传递拉入，程序从不使用
+    "qt6network.dll",
+    # SVG：无运行时 SVG 资源
+    "qt6svg.dll",
+    # generic 插件：触屏输入，桌面程序不需要，且其依赖 Qt6Network
+    "qtuiotouchplugin.dll",
+    # iconengines：SVG 图标引擎
+    "qsvgicon.dll",
+    # imageformats：程序不加载任何 JPEG/WebP/TIFF/GIF/ICO/ICNS/TGA/WBMP/SVG 图片，
+    # PNG 编解码内置于 Qt6Gui.dll，导出截图无需任何 imageformat 插件
+    "qjpeg.dll", "qwebp.dll", "qtiff.dll", "qgif.dll", "qicns.dll",
+    "qico.dll", "qtga.dll", "qwbmp.dll", "qsvg.dll", "qdds.dll",
+    # platforms：正式 Windows 发布只需 qwindows.dll；
+    # qdirect2d/qminimal/qoffscreen 仅测试环境需要
+    "qdirect2d.dll", "qminimal.dll", "qoffscreen.dll",
+    # styles：Qt6Widgets 内置 Windows/Fusion 等样式，无需额外插件
+    "qmodernwindowsstyle.dll",
+    # Qt 软件 OpenGL 回退库：纯 QPainter 栅格绘制从不触发 OpenGL 上下文
+    "opengl32sw.dll",
+    "libEGL.dll",
+    "libGLESv2.dll",
+    "d3dcompiler_47.dll",
+    # libcrypto-1_1.dll：由 Python 标准库 hashlib 链（importlib.metadata→email→
+    # random→hashlib→_hashlib.pyd）静态分析拉入。random 实际使用内置 _sha512，
+    # 冻结应用运行路径从不触发 hashlib（无网络/无加密/无文件哈希）。
+    # 经"构建→启动→操作 GUI→导出 PNG→自动测试"验证后可安全剔除。
+    "libcrypto-1_1.dll",
+}
+
+
+def _keep_binary(entry):
+    return os.path.basename(entry[0]).lower() not in _BIN_DROP
+
+
+a.binaries = [b for b in a.binaries if _keep_binary(b)]
+
+# 剔除整套 Qt 多语言翻译（程序不使用 QTranslator，需求 7.2）。
+# 96 个 .qm 全部为无关数据；若未来需要中文 Qt 内置文案，再单独补 zh_CN。
+a.datas = [d for d in a.datas
+           if "\\translations\\" not in d[0].replace("/", "\\")]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

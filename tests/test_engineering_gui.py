@@ -52,13 +52,17 @@ def win(qapp):
 # ---------------------------------------------------------------------------
 def test_engine_default_computes_and_reports(win):
     assert win._engine_ok
+    # 需求 5.1：默认【关键结果】精简区含工程关键量 + 精简分析/建议
     text = win.resultBox.toPlainText()
-    # 工程设计结果 / 应力 / 分析 / 建议均已接入右侧
-    assert "Re" in text and "Lr_calc" in text
     assert "【分析】" in text and "【建议】" in text
-    assert "M_req_max" in text
+    assert "M_req_max" in text and "Q_overload" in text
     # 现有工作点字段零回退
     assert "K    =" in text and "M(fn)=" in text
+    # 完整工程/应力中间量移入"详细信息"区（默认折叠）
+    win.detailToggle.setChecked(True)
+    win._do_update()
+    detail = win.detailBox.toPlainText()
+    assert "Re" in detail and "Lr_calc" in detail
 
 
 def test_engine_keys_present(win):

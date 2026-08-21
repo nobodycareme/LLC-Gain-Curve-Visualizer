@@ -111,7 +111,8 @@ def test_legend_contains_four_markers(win):
     assert "峰值" in joined
     assert "工作点 fn" in joined
     assert "阻容分界线" in joined
-    assert "∠Zin = 0" in joined
+    # 需求 3.1：名称统一为"阻容分界线"，不得再显示 "∠Zin=0"
+    assert "∠Zin" not in joined
     # 9 条参考 Q + 当前 Q + 阻容边界 + 4 个标记
     assert len(texts) == 15
 
@@ -241,12 +242,20 @@ def test_ymax_applies_to_axis(win):
 
 def test_result_box_contains_required_fields(win):
     win._do_update()
+    # 需求 5.1：默认【关键结果】精简区含当前参数与工程关键量
     text = win.resultBox.toPlainText()
-    for token in ("K    =", "Q    =", "fn   =", "M(fn)=", "fs", "fnp",
-                  "fp", "M(fnp)", "fnr", "fr", "M(fnr)", "fn_peak",
-                  "f_peak", "M_peak", "彩色细线", "黑色粗线", "并联谐振",
-                  "串联谐振", "K  = Lm / Lr", "fn = fs / fr"):
-        assert token in text, f"结果区缺少字段：{token}"
+    for token in ("K    =", "Q    =", "fn   =", "M(fn)=", "fs",
+                  "M_req_min", "M_req_max", "Q_full", "Q_overload",
+                  "fn_min", "fn_max", "Ioe", "Irms", "Vpeak"):
+        assert token in text, f"关键结果区缺少字段：{token}"
+    # 详细辅助诊断移入"详细信息"区（默认折叠，展开后可见）
+    win.detailToggle.setChecked(True)   # 展开详细信息
+    win._do_update()
+    detail = win.detailBox.toPlainText()
+    for token in ("fnp", "fp", "M(fnp)", "fnr", "M(fnr)", "fnpeak",
+                  "Mpeak", "fn_boundary", "K  = Lm / Lr", "fn = fs / fr",
+                  "∠Zin", "感性区", "Re", "Lr_calc"):
+        assert token in detail, f"详细信息区缺少字段：{token}"
 
 
 def test_result_box_has_no_old_symbols(win):
@@ -258,8 +267,11 @@ def test_result_box_has_no_old_symbols(win):
 
 def test_result_box_has_region_and_boundary(win):
     win._do_update()
-    text = win.resultBox.toPlainText()
-    assert "工作区域" in text
+    # 区域/边界等辅助诊断在"详细信息"区（需求 5.1 分层）
+    win.detailToggle.setChecked(True)
+    win._do_update()
+    text = win.detailBox.toPlainText()
+    assert "感性区" in text or "容性区" in text or "阻容边界" in text
     assert "fn_boundary" in text
     assert "∠Zin" in text
 

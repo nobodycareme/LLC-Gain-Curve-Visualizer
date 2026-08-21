@@ -88,8 +88,9 @@ def test_boundary_line_matches_analytic_solution(win):
         return 0.0 if v != v or v > 1e6 else float(v)
     assert all(norm(a) == pytest.approx(norm(b), abs=1e-6)
                for a, b in zip(y, ref))
-    # 边界 x 范围在 (fm0, 1) 内，首点有限（奇点已用容差避开）
-    assert x[0] > fm0 and x[-1] < 1.0
+    # 边界 x 范围在 (fm0, 1] 内，首点有限（奇点已用容差避开）；
+    # 末点必须精确落在 fn=1（需求 3.2B：弯曲段准确连接到 (1,1)，不留 1e-6 缺口）
+    assert x[0] > fm0 and x[-1] == pytest.approx(1.0, abs=1e-9)
 
 
 def test_boundary_recomputes_on_k_change(win):
@@ -155,8 +156,10 @@ def test_boundary_frequency_matches_model(win):
 
 def test_result_text_contains_region_and_boundary(win):
     _set_sliders_and_update(win, K=5.0, Q=0.5, fn=1.1)
-    text = win.resultBox.toPlainText()
-    assert "工作区域" in text
+    # 区域/边界等辅助诊断在"详细信息"区（需求 5.1 分层）
+    win.detailToggle.setChecked(True)
+    win._do_update()
+    text = win.detailBox.toPlainText()
     assert "感性区" in text or "容性区" in text or "阻容边界" in text
     assert "fn_boundary" in text
     assert "∠Zin" in text

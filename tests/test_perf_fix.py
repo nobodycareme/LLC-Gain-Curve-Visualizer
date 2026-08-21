@@ -213,9 +213,9 @@ def test_slider_release_triggers_full_refresh(qapp):
     counter = {"n": 0}
     orig = w._do_update
 
-    def spy():
+    def spy(*a, **kw):
         counter["n"] += 1
-        orig()
+        orig(*a, **kw)
 
     w._do_update = spy
     w.sliderFn.setValue(700)
@@ -307,7 +307,10 @@ def test_dirty_flags_merge_high_frequency(qapp):
 def test_slider_labels_use_new_symbols(win):
     """使用 QPainter 控件，标签文本为 K = Lm/Lr、fn = fs/fr。"""
     assert isinstance(win.canvas, GainPlotWidget), "主画布应为 QPainter 控件"
-    text = win.resultBox.toPlainText()
+    # 参数定义在"详细信息"区（需求 5.1 分层）
+    win.detailToggle.setChecked(True)
+    win._do_update()
+    text = win.detailBox.toPlainText()
     assert "K  = Lm / Lr" in text
     assert "fn = fs / fr" in text
 
