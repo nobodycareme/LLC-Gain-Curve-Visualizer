@@ -39,3 +39,17 @@ desktop.ini
 .DS_Store
 # ---- Release 验证下载目录 ----
 github_release_verify/
+
+# ---- 本地验收 / 探针 / 临时截图（非发布物） ----
+_accept*/
+_shot_*.png
+scripts/_sc*.png
+scripts/_sc2_*.png
+scripts/_native_shots/
+scripts/_capture_native.py
+scripts/_probe_native_heights.py
+scripts/_accept_*.py
+scripts/accept_ui_v2.py
+scripts/probe_*.py
+scripts/profile_k.py
+scripts/capture_resolutions.ps1

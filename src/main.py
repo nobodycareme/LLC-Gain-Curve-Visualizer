@@ -36,24 +36,28 @@ import sys
 
 # 同步导入顺序：PlotWidget / 数学层均为纯 Python（无 numpy / matplotlib），
 # 显著降低冷启动与最终体积。
-from PySide6.QtCore import QObject, Qt, QTimer, QElapsedTimer  # noqa: E402
-from PySide6.QtGui import QFont  # noqa: E402
+from PySide6.QtCore import QObject, Qt, QTimer, QElapsedTimer, QSettings  # noqa: E402
+from PySide6.QtGui import QFont, QAction  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QMainWindow,
-    QPlainTextEdit,
+    QMenu,
+    QScrollArea,
     QSizePolicy,
     QSlider,
+    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 # 兼容两种运行方式：直接运行 src/main.py，以及 PyInstaller 打包后运行
@@ -89,10 +93,8 @@ from llc_stress import (  # noqa: E402
     secondary_currents,
 )
 from llc_report import (  # noqa: E402
-    format_key_results,
-    format_detail_results,
-    format_short_analysis,
-    format_short_suggestions,
+    build_result_cards,
+    build_result_sections,
 )
 
 APP_TITLE = "LLC 谐振变换器交互式多增益曲线"
@@ -225,6 +227,354 @@ def _slider_from_log(value: float, lo: float, hi: float) -> int:
     return int(round(frac * SLIDER_STEPS))
 
 
+# ---------------------------------------------------------------------------
+# 全局主题（需求九）：Windows 11 / Fluent 2 风格专业桌面工具。
+# 颜色只作用于控件外壳，绝不改变 LLC 曲线本身的配色。
+# ---------------------------------------------------------------------------
+#: 分析标记配色（✓=成功 / ⚠=警告 / ✕=错误），仅用于结果区分析/建议着色。
+_FLAG_COLOR = {"✓": "#16A34A", "⚠": "#D97706", "✕": "#DC2626"}
+
+APP_QSS = """
+QWidget#central {
+    background: #F6F8FB;
+}
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+
+/* ---- 顶部标题/签名/状态 ---- */
+#titleLabel  { font-size: 14pt; font-weight: 600; color: #0F172A; }
+#centerLabel { color: #475569; }
+#statusLabel { color: #334155; }
+QLabel { color: #0F172A; }
+
+/* ---- 卡片外壳（替代传统 QGroupBox 线框标题，需求 9.3） ---- */
+QFrame#card {
+    background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px;
+}
+QFrame#subCard {
+    background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 6px;
+}
+QFrame#card > QLabel#cardTitle,
+QLabel#cardTitle {
+    font-size: 10pt; font-weight: 600; color: #0F172A; padding: 0;
+}
+QLabel#cardBody {
+    font-size: 9.5pt; color: #334155; background: transparent;
+}
+QLabel#fieldLabel { font-size: 9pt; color: #64748B; }
+QLabel#resultName  { font-size: 9.5pt; color: #64748B; }
+QLabel#resultValue { font-size: 9.5pt; font-weight: 600; color: #0F172A; }
+QLabel#resultFlag  { font-size: 9.5pt; font-weight: 600; }
+QLabel#engStatus   { font-size: 9pt; color: #16A34A; }
+
+QCheckBox {
+    spacing: 6px; color: #334155; font-size: 9.5pt;
+}
+
+/* ---- 输入控件（统一 30px 高、圆角、白底，需求 9.5） ---- */
+QDoubleSpinBox, QComboBox {
+    background: #FFFFFF;
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    padding: 4px 8px;
+    min-height: 30px;
+    min-width: 90px;
+    color: #0F172A;
+    selection-background-color: #DBEAFE;
+    selection-color: #0F172A;
+    font-size: 9.5pt;
+}
+QDoubleSpinBox:hover, QComboBox:hover { border-color: #94A3B8; }
+QDoubleSpinBox:focus, QComboBox:focus  { border-color: #2563EB; }
+QDoubleSpinBox:disabled, QComboBox:disabled {
+    background: #F1F5F9; color: #94A3B8; border-color: #E2E8F0;
+}
+
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox::down-arrow { width: 8px; height: 8px; image: none; }
+QComboBox QAbstractItemView {
+    background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 6px;
+    outline: none; color: #0F172A;
+    selection-background-color: #DBEAFE; selection-color: #0F172A;
+}
+QComboBox QAbstractItemView::item { min-height: 24px; padding: 2px 8px; }
+QComboBox QAbstractItemView::item:hover { background: #F1F5F9; }
+
+/* ---- 滑杆（需求 9.4）：4px 轨道 + 圆形手柄 ---- */
+QSlider::groove:horizontal { height: 4px; background: #E2E8F0; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #2563EB; border-radius: 2px; }
+QSlider::handle:horizontal {
+    width: 16px; height: 16px; margin: -6px 0;
+    background: #FFFFFF; border: 2px solid #2563EB; border-radius: 8px;
+}
+QSlider::handle:horizontal:hover { background: #DBEAFE; border-color: #2563EB; }
+
+/* ---- 滚动条（需求 9.6）：窄、透明背景、去上下三角 ---- */
+QScrollBar:vertical { width: 10px; background: transparent; margin: 0; }
+QScrollBar::handle:vertical { background: #CBD5E1; border-radius: 5px; min-height: 24px; }
+QScrollBar::handle:vertical:hover { background: #94A3B8; }
+QScrollBar:horizontal { height: 10px; background: transparent; margin: 0; }
+QScrollBar::handle:horizontal { background: #CBD5E1; border-radius: 5px; min-width: 24px; }
+QScrollBar::handle:horizontal:hover { background: #94A3B8; }
+QScrollBar::add-line:vertical,   QScrollBar::sub-line:vertical,
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { height: 0; width: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+"""
+
+
+#: 单张结果卡：标题 + 内容区。内容可以是 label|value 网格（工作点/谐振腔/调频/应力）
+#: 或标记文本行（设计分析/建议）。卡片只创建一次，渲染仅更新 QLabel 文本/显隐。
+class _ResultCard(QFrame):
+    def __init__(self, title: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("card")
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(6)
+        lay.setSizeConstraint(QLayout.SetMinAndMaxSize)
+        self.titleLabel = QLabel(title)
+        self.titleLabel.setObjectName("cardTitle")
+        lay.addWidget(self.titleLabel)
+        # label|value 网格层（kv 行）
+        self.grid = QGridLayout()
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setHorizontalSpacing(16)
+        self.grid.setVerticalSpacing(3)
+        self.grid.setColumnStretch(1, 1)
+        lay.addLayout(self.grid)
+        # 标记文本层（flag / bullet 行）
+        self.bodyLayout = QVBoxLayout()
+        self.bodyLayout.setContentsMargins(0, 0, 0, 0)
+        self.bodyLayout.setSpacing(3)
+        lay.addLayout(self.bodyLayout)
+        self.grid_enabled = True
+        self._pairs: dict[str, tuple[QLabel, QLabel]] = {}  # name -> (name_lab, value_lab)
+        self._named = []                                    # name 插入顺序
+        self._body_widgets: list[tuple[QWidget, QLabel, QLabel]] = []  # (row, flag_lab, text_lab)
+
+    def show_grid(self, enabled: bool) -> None:
+        if enabled == self.grid_enabled:
+            return
+        self.grid_enabled = enabled
+        # 两个层不做重复隐藏：卡片类型跨渲染不变（kv 卡与否），此处只保证当前层可见。
+        if enabled:
+            for row_w, _f, _t in self._body_widgets:
+                row_w.setVisible(False)
+        else:
+            for _n, (nl, vl) in self._pairs.items():
+                nl.setVisible(False)
+                vl.setVisible(False)
+
+
+class ResultPanel(QScrollArea):
+    """右侧结果区：**唯一**滚动区域、唯一一个垂直滚动条。
+
+    结构::
+
+        QScrollArea
+          └── resultContent
+                └── resultLayout (AlignTop, 无 addStretch, SetMinAndMaxSize)
+                      ├── card「当前工作点」
+                      ├── card「谐振腔参数」
+                      ├── card「调频范围」
+                      ├── card「电流与应力」
+                      ├── card「设计分析」
+                      └── card「建议」
+
+    尺寸交给 Qt 依据内容自动维护。启动即含全部卡片，首屏立即可见。
+    """
+
+    CARD_TITLES = ("当前工作点", "谐振腔参数", "调频范围",
+                   "电流与应力", "设计分析", "建议")
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumWidth(300)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self.resultContent = QWidget()
+        self.resultLayout = QVBoxLayout(self.resultContent)
+        self.resultLayout.setContentsMargins(0, 0, 0, 0)
+        self.resultLayout.setSpacing(12)
+        self.resultLayout.setAlignment(Qt.AlignTop)
+        self.resultLayout.setSizeConstraint(QLayout.SetMinAndMaxSize)
+        self.setWidget(self.resultContent)
+
+        self._cards: list[_ResultCard] = []
+        for title in self.CARD_TITLES:
+            self._cards.append(self._new_card(title))
+
+        self._last_text = ""
+        self._error_label = None
+
+    def _new_card(self, title: str) -> _ResultCard:
+        card = _ResultCard(title)
+        self.resultLayout.addWidget(card)
+        return card
+
+    # ---- card 定位 ----
+    def _card_by_title(self, title: str) -> _ResultCard | None:
+        for c in self._cards:
+            if c.titleLabel.text() == title:
+                return c
+        return None
+
+    def _render_card(self, card: _ResultCard, rows: list) -> None:
+        """把一行结构化 rows 渲染进一张既有卡片；只更新 QLabel，不重建 widget。"""
+        card.setVisible(True)
+        if rows and rows[0][0] == "kv":
+            card.show_grid(True)
+            self._render_kv(card, rows)
+        else:
+            card.show_grid(False)
+            self._render_body(card, rows)
+
+    def _render_kv(self, card: _ResultCard, rows: list) -> None:
+        """label|value 网格：按名称就地更新 value QLabel（对象身份稳定，需求 16）。"""
+        row_i = 0
+        seen: list[str] = []
+        for name, value in ((r[1], r[2]) for r in rows):
+            pair = card._pairs.get(name)
+            if pair is None:
+                nl = QLabel(name)
+                nl.setObjectName("resultName")
+                vl = QLabel(value)
+                vl.setObjectName("resultValue")
+                vl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                card.grid.addWidget(nl, row_i, 0)
+                card.grid.addWidget(vl, row_i, 1)
+                card._pairs[name] = (nl, vl)
+                card._named.append(name)
+            else:
+                nl, vl = pair
+                vl.setText(value)
+            nl.setVisible(True)
+            vl.setVisible(True)
+            seen.append(name)
+            row_i += 1
+        for name, (nl, vl) in card._pairs.items():
+            if name not in seen:
+                nl.setVisible(False)
+                vl.setVisible(False)
+
+    def _render_body(self, card: _ResultCard, rows: list) -> None:
+        """标记文本层（设计分析 ✓/⚠/✕、建议 •）：就地复用行 widget。"""
+        while len(card._body_widgets) < len(rows):
+            row_w = QWidget()
+            rl = QHBoxLayout(row_w)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(6)
+            flag_lab = QLabel("")
+            flag_lab.setObjectName("resultFlag")
+            text_lab = QLabel("")
+            text_lab.setObjectName("cardBody")
+            text_lab.setWordWrap(True)
+            text_lab.setTextFormat(Qt.PlainText)
+            rl.addWidget(flag_lab, 0)
+            rl.addWidget(text_lab, 1)
+            card.bodyLayout.addWidget(row_w)
+            card._body_widgets.append((row_w, flag_lab, text_lab))
+        for i, row in enumerate(rows):
+            row_w, flag_lab, text_lab = card._body_widgets[i]
+            if row[0] == "flag":          # ("flag", ✓/⚠/✕, 消息)
+                flag, msg = row[1], row[2]
+                flag_lab.setText(flag)
+                flag_lab.setStyleSheet(
+                    "color:%s;" % _FLAG_COLOR.get(flag, "#0F172A"))
+                text_lab.setText(msg)
+            else:                          # ("bullet", 文本)
+                flag_lab.setText("•")
+                flag_lab.setStyleSheet("color:#64748B;")
+                text_lab.setText(row[1])
+            row_w.setVisible(True)
+            flag_lab.setVisible(True)
+            text_lab.setVisible(True)
+        for j in range(len(rows), len(card._body_widgets)):
+            row_w, _f, _t = card._body_widgets[j]
+            row_w.setVisible(False)
+
+    # ---- 对外契约（兼容旧 ResultCardsView / QPlainTextEdit 用法） ----
+    def set_cards(self, cards: list) -> str:
+        """渲染结构化卡片，返回压平后的合并文本（供 toPlainText 兼容）。
+
+        卡片固定 6 张；未出现的 section 隐藏其卡片。只更新 QLabel 文本。
+        """
+        combined = self._flatten(cards)
+        present = {title for title, _rows in cards}
+        for card in self._cards:
+            if card.titleLabel.text() in present:
+                rows = next(r for t, r in cards if t == card.titleLabel.text())
+                self._render_card(card, rows)
+            else:
+                card.setVisible(False)
+        self._last_text = combined
+        return combined
+
+    def _flatten(self, cards: list) -> str:
+        pieces = []
+        for title, rows in cards:
+            texts = []
+            for row in rows:
+                if row[0] == "kv":
+                    texts.append(f"{row[1]:<16}  {row[2]}")
+                elif row[0] == "flag":
+                    texts.append(f"{row[1]}  {row[2]}")
+                else:
+                    texts.append(f"•  {row[1]}")
+            pieces.append("【%s】\n%s" % (title, "\n".join(texts)))
+        return "\n\n".join(pieces)
+
+    def toPlainText(self) -> str:
+        return self._last_text
+
+    def setPlainText(self, text: str) -> None:
+        """异常/纯文本回退：隐藏全部卡片，显示一个持久错误行（需求 6.2 无 hack）。"""
+        self._last_text = text
+        for card in self._cards:
+            card.setVisible(False)
+        if self._error_label is None:
+            self._error_label = QLabel("")
+            self._error_label.setObjectName("cardBody")
+            self._error_label.setWordWrap(True)
+            self._error_label.setTextFormat(Qt.PlainText)
+            self._error_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            self.resultLayout.addWidget(self._error_label)
+        self._error_label.setText(text)
+        self._error_label.setVisible(True)
+
+
+class FieldPair(QWidget):
+    """工程参数的一个字段：label + control 绑定为**独立** QWidget。
+
+    每个参数自成一个布局单元（QHBoxLayout），label 与自己的 control 同处一个
+    容器。工程区网格只摆放 FieldPair，杜绝"label 跑进上一个参数的 control"
+    （需求 2.1 / 5）：不同 FieldPair 的 label/control 永远处于不同 grid cell，
+    几何上不可能互相 intersect。
+    """
+
+    def __init__(self, label_text: str, control: QWidget, parent=None) -> None:
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        self.label = QLabel(label_text)
+        self.label.setStyleSheet("color: #64748B; font-size: 11px;")
+        # label 永不压缩到文字宽度以下（完整显示，不省略）
+        self.label.setMinimumWidth(self.label.sizeHint().width())
+        self.control = control
+        lay.addWidget(self.label, 0)
+        lay.addWidget(self.control, 1)
+
+
 class MainWindow(QMainWindow):
     """主窗口：顶部标题/状态栏 + 左侧 QPainter 增益画布 + 右侧结果框 + 底部参数面板。"""
 
@@ -252,6 +602,12 @@ class MainWindow(QMainWindow):
         self._eng_debounce.setInterval(ENG_DEBOUNCE_MS)
         self._eng_debounce.timeout.connect(self._on_eng_debounce)
         self._eng_debounce_sender = None
+
+        # ---- Q 数字输入自动提交 debounce（需求 5.2：300ms，无需失焦） ----
+        self._q_debounce = QTimer(self)
+        self._q_debounce.setSingleShot(True)
+        self._q_debounce.setInterval(ENG_DEBOUNCE_MS)
+        self._q_debounce.timeout.connect(self._commit_q_spin)
 
         # ---- 工程设计事务式状态（Phase 6，需求二十六） ----
         self._engine_dirty = True       # 工程设计输入变化需要重算
@@ -320,67 +676,94 @@ class MainWindow(QMainWindow):
         self.titleLabel.setMinimumHeight(28)
         header.addWidget(self.titleLabel)
 
+        # 中部：院校 + 姓名（需求八）：与右侧状态栏同字号（11pt），Semibold/Medium
+        self.centerLabel = QLabel("西安电子科技大学   张名扬")
+        self.centerLabel.setObjectName("centerLabel")
+        self.centerLabel.setFont(QFont(qt_font_family() or "", 11, QFont.Medium))
+        self.centerLabel.setAlignment(Qt.AlignCenter)
+        self.centerLabel.setMinimumHeight(28)
+        header.addWidget(self.centerLabel, stretch=1)
+
         self.statusLabel = QLabel("")
-        self.statusLabel.setFont(QFont(qt_font_family() or "", 11))
+        self.statusLabel.setObjectName("statusLabel")
+        self.statusLabel.setFont(QFont(qt_font_family() or "", 11))  # Regular
         self.statusLabel.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.statusLabel.setMinimumHeight(28)
         header.addWidget(self.statusLabel, stretch=1)
         root.addLayout(header)
 
-        # ---------- 上半部分：画布 + 结果框 ----------
-        upper = QHBoxLayout()
-        upper.setSpacing(8)
+        # ---------- 上半部分：QSplitter 画布 | 结果（需求十一） ----------
+        # 曲线拥有窗口剩余空间的绝对优先权（需求一/七/八）。
+        # QSplitter 允许用户拖动改变曲线/结果宽度比；结果侧栏可折叠。
+        self.splitter = QSplitter(Qt.Horizontal)
+        # 需求 3.2：禁止 splitter 拖到零；折叠只通过我们的明确按钮实现。
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, False)
+        self.splitter.setHandleWidth(4)
+        self.splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.canvas = GainPlotWidget()
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.canvas.setMinimumWidth(560)
-        self.canvas.setMinimumHeight(420)
-        upper.addWidget(self.canvas, stretch=3)
+        self.canvas.setMinimumWidth(400)
+        self.canvas.setMinimumHeight(280)
+        self.splitter.addWidget(self.canvas)
 
-        # 右侧：默认【关键结果】精简区 + 可展开"详细信息"（需求 5.1）
-        right_col = QVBoxLayout()
-        right_col.setSpacing(3)
-        self.resultBox = QPlainTextEdit()
-        self.resultBox.setReadOnly(True)
-        self.resultBox.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.resultBox.setMinimumWidth(330)
-        self.resultBox.setMaximumWidth(430)
-        self.resultBox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        mono = QFont(qt_font_family() or "Consolas", 10)
-        self.resultBox.setFont(mono)
-        right_col.addWidget(self.resultBox, stretch=1)
+        # 右侧 Sidebar（需求 3/4）：窄控制条常驻 + ResultPanel。
+        # 折叠时**只隐藏 resultBox**，控制条（含恢复按钮）始终可见，
+        # 从而彻底解决"结果区消失 + 恢复按钮一起消失"的 BUG。
+        self.rightWidget = QWidget()
+        rightLayout = QVBoxLayout(self.rightWidget)
+        rightLayout.setContentsMargins(0, 0, 0, 0)
+        rightLayout.setSpacing(0)
+        # 窄控制条：展开/折叠都保留，折叠时 Sidebar 收窄为 ~22~24px。
+        self.sidebarBar = QWidget()
+        barLay = QHBoxLayout(self.sidebarBar)
+        barLay.setContentsMargins(0, 0, 0, 0)
+        barLay.setSpacing(0)
+        self.resultCollapseBtn = QToolButton()
+        self.resultCollapseBtn.setText("«")
+        self.resultCollapseBtn.setMaximumHeight(14)
+        self.resultCollapseBtn.setMaximumWidth(20)
+        self.resultCollapseBtn.setToolTip("隐藏/显示结果侧栏")
+        self.resultCollapseBtn.clicked.connect(self._toggle_result_sidebar)
+        barLay.addStretch(1)
+        barLay.addWidget(self.resultCollapseBtn)
+        rightLayout.addWidget(self.sidebarBar)
 
-        self.detailToggle = QToolButton()
-        self.detailToggle.setText("详细信息 ▼")
-        self.detailToggle.setCheckable(True)
-        self.detailToggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.detailToggle.setAutoRaise(True)
-        self.detailToggle.setStyleSheet("text-align:left; color:#555;")
-        self.detailToggle.toggled.connect(self._on_detail_toggle)
-        right_col.addWidget(self.detailToggle, stretch=0)
+        self.resultBox = ResultPanel()
+        self.resultBox.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        rightLayout.addWidget(self.resultBox, stretch=1)
+        self.splitter.addWidget(self.rightWidget)
 
-        self.detailBox = QPlainTextEdit()
-        self.detailBox.setReadOnly(True)
-        self.detailBox.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.detailBox.setMinimumWidth(330)
-        self.detailBox.setMaximumWidth(430)
-        self.detailBox.setMinimumHeight(120)
-        self.detailBox.setMaximumHeight(280)
-        self.detailBox.setFont(mono)
-        self.detailBox.setVisible(False)
-        right_col.addWidget(self.detailBox, stretch=0)
+        # 需求 4：Sidebar wrapper 约束宽度（300~370px），ResultPanel 填满整个
+        # wrapper（Expanding），杜绝"wrapper 宽、ResultPanel 窄"的右侧空白带。
+        self.rightWidget.setMinimumWidth(300)
+        self.rightWidget.setMaximumWidth(370)
+        self._sidebar_expanded = True
 
-        upper.addLayout(right_col, stretch=1)
+        # 默认比例 78:22（需求九）
+        self.splitter.setStretchFactor(0, 78)
+        self.splitter.setStretchFactor(1, 22)
+        self.splitter.setSizes([1000, 280])
+        self._result_sizes = None
 
-        root.addLayout(upper, stretch=1)
+        root.addWidget(self.splitter, stretch=1)
 
-        # ---------- 下半部分：参数调节 ----------
-        panel = QGroupBox("参数调节")
-        panel.setFont(QFont(qt_font_family() or "", 10, QFont.Bold))
-        grid = QGridLayout(panel)
-        grid.setContentsMargins(12, 14, 12, 10)
+        # ---------- 下半部分：参数调节（需求 9.3：Card + 标题，非 QGroupBox 线框） ----------
+        panel = QFrame()
+        panel.setObjectName("card")
+        pv = QVBoxLayout(panel)
+        pv.setContentsMargins(12, 6, 12, 6)
+        pv.setSpacing(4)
+        ptitle = QLabel("参数调节")
+        ptitle.setObjectName("cardTitle")
+        pv.addWidget(ptitle)
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
+        grid.setVerticalSpacing(4)
+        pv.addLayout(grid)
 
         # --- K = Lm/Lr（线性滑块，1.5~10，默认 5） ---
         grid.addWidget(QLabel("K = Lm/Lr"), 0, 0)
@@ -394,16 +777,22 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.labelK, 0, 2)
         grid.addWidget(QLabel(f"（范围 {K_MIN} ~ {K_MAX}）"), 0, 3)
 
-        # --- Q（对数滑块） ---
+        # --- Q（对数滑块）+ 数字输入（需求 5：滑块↔输入框双向同步） ---
         grid.addWidget(QLabel("当前 Q"), 1, 0)
         self.sliderQ = QSlider(Qt.Horizontal)
         self.sliderQ.setRange(0, SLIDER_STEPS)
         self.sliderQ.setValue(_slider_from_log(DEFAULT_Q, Q_MIN, Q_MAX))
         self.sliderQ.setMinimumWidth(240)
         grid.addWidget(self.sliderQ, 1, 1)
-        self.labelQ = QLabel("0.5000")
-        self.labelQ.setMinimumWidth(66)
-        grid.addWidget(self.labelQ, 1, 2)
+        self.spinQ = QDoubleSpinBox()
+        self.spinQ.setDecimals(4)
+        self.spinQ.setRange(Q_MIN, Q_MAX)
+        self.spinQ.setValue(DEFAULT_Q)
+        self.spinQ.setSingleStep(0.01)
+        self.spinQ.setKeyboardTracking(False)
+        self.spinQ.setFixedWidth(104)
+        grid.addWidget(self.spinQ, 1, 2)
+        # 需求七：只保留范围提示，删除"输入后 300ms 自动生效"文案（内部 debounce 仍为 300ms）
         grid.addWidget(QLabel(f"（对数，{Q_MIN} ~ {Q_MAX}）"), 1, 3)
 
         # --- fn = fs/fr（对数滑块，0.1~10，默认 1） ---
@@ -442,120 +831,51 @@ class MainWindow(QMainWindow):
         fr_box.addStretch(1)
         grid.addLayout(fr_box, 1, 5, 1, 3)
 
-        self.hintLabel = QLabel(
-            "参考曲线：Q = 0.1、0.2、0.5、0.8、1、2、5、8、10"
-        )
-        grid.addWidget(self.hintLabel, 2, 0, 1, 8)
+        self.hintLabel = None  # 需求 6：已彻底删除"参考曲线：Q=..."说明行
 
         grid.setColumnStretch(1, 3)
         grid.setColumnStretch(5, 3)
         grid.setColumnStretch(3, 1)
         grid.setColumnStretch(7, 1)
 
-        panel.setMaximumHeight(170)
+        panel.setMaximumHeight(100)
         root.addWidget(panel, stretch=0)
 
-        # ---------- 底部第二行：工程设计参数 + 显示选项 ----------
-        eng_row = QHBoxLayout()
-        eng_row.setSpacing(8)
+        # ---------- 底部：工程参数抽屉（默认折叠）+ 显示选项 Popup ----------
+        # 需求三：工程参数默认折叠，仅显示紧凑横条（~36px）；点击展开横向布局（~150px）。
+        # 需求六：显示选项改为 Popup QMenu，不再永久占 Card。
+        self.engPanel = QFrame()
+        self.engPanel.setObjectName("card")
+        self.engPanel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        engDrawerLay = QVBoxLayout(self.engPanel)
+        engDrawerLay.setContentsMargins(12, 4, 12, 4)
+        engDrawerLay.setSpacing(0)
 
-        # --- 工程设计参数面板（Phase 6，需求十一） ---
-        eng_panel = QGroupBox("工程设计参数（FHA estimate）")
-        eng_panel.setFont(QFont(qt_font_family() or "", 10, QFont.Bold))
-        egrid = QGridLayout(eng_panel)
-        egrid.setContentsMargins(10, 12, 10, 8)
-        egrid.setHorizontalSpacing(8)
-        egrid.setVerticalSpacing(5)
-        r = 0
-
-        def spin(dec, lo, hi, val, st=1.0, w=76):
-            sb = QDoubleSpinBox()
-            sb.setDecimals(dec)
-            sb.setRange(lo, hi)
-            sb.setValue(val)
-            sb.setSingleStep(st)
-            sb.setKeyboardTracking(False)
-            sb.setMinimumWidth(w)
-            return sb
-
-        # 行 0：Vin_min / Vin_nom / Vin_max
-        for col, (lbl, sb) in enumerate([
-            ("Vin_min/V", None), ("Vin_nom/V", None), ("Vin_max/V", None)]):
-            egrid.addWidget(QLabel(lbl), r, col * 2)
-        self.spinVinMin = spin(1, 1.0, 1e5, DEFAULT_VIN_MIN, 5.0)
-        self.spinVinNom = spin(1, 1.0, 1e5, DEFAULT_VIN_NOM, 5.0)
-        self.spinVinMax = spin(1, 1.0, 1e5, DEFAULT_VIN_MAX, 5.0)
-        for col, sb in enumerate((self.spinVinMin, self.spinVinNom, self.spinVinMax)):
-            egrid.addWidget(sb, r, col * 2 + 1)
-        r += 1
-
-        # 行 1：Vo / Pout / Io
-        egrid.addWidget(QLabel("Vo/V"), r, 0)
-        self.spinVo = spin(2, 0.1, 1e4, DEFAULT_VO, 1.0)
-        egrid.addWidget(self.spinVo, r, 1)
-        egrid.addWidget(QLabel("Pout/W"), r, 2)
-        self.spinPout = spin(1, 0.1, 1e7, DEFAULT_POUT, 10.0)
-        egrid.addWidget(self.spinPout, r, 3)
-        egrid.addWidget(QLabel("Io/A"), r, 4)
-        self.spinIo = spin(2, 0.01, 1e6, DEFAULT_IO, 1.0)
-        egrid.addWidget(self.spinIo, r, 5)
-        r += 1
-
-        # 行 2：拓扑 / 整流
-        egrid.addWidget(QLabel("拓扑"), r, 0)
-        self.comboBridge = QComboBox()
-        self.comboBridge.addItems([t for t, _ in BRIDGE_OPTIONS])
-        self.comboBridge.setCurrentIndex(0)
-        egrid.addWidget(self.comboBridge, r, 1)
-        egrid.addWidget(QLabel("次级整流"), r, 2)
-        self.comboRect = QComboBox()
-        self.comboRect.addItems([t for t, _ in RECT_OPTIONS])
-        self.comboRect.setCurrentIndex(1)   # 中心抽头同步整流
-        egrid.addWidget(self.comboRect, r, 3, 1, 3)
-        r += 1
-
-        # 行 3：匝比 / Q 模式
-        egrid.addWidget(QLabel("匝比"), r, 0)
-        self.comboTurn = QComboBox()
-        self.comboTurn.addItems(["自动", "手动"])
-        self.comboTurn.setCurrentIndex(0)
-        egrid.addWidget(self.comboTurn, r, 1)
-        self.spinN = spin(3, 0.01, 1e4, DEFAULT_N, 0.5, 76)
-        self.spinN.setEnabled(False)
-        egrid.addWidget(self.spinN, r, 2)
-        egrid.addWidget(QLabel("Q 模式"), r, 3)
-        self.comboQMode = QComboBox()
-        self.comboQMode.addItems(["手动", "自动推荐"])
-        self.comboQMode.setCurrentIndex(0)
-        egrid.addWidget(self.comboQMode, r, 4, 1, 2)
-        r += 1
-
-        # 行 4：效率 / Vf / 过载
-        egrid.addWidget(QLabel("η"), r, 0)
-        self.spinEta = spin(3, 0.01, 1.0, DEFAULT_ETA, 0.01, 64)
-        egrid.addWidget(self.spinEta, r, 1)
-        egrid.addWidget(QLabel("Vf(V)"), r, 2)
-        self.spinVdrop = spin(3, 0.0, 5.0, DEFAULT_VF, 0.05, 64)
-        egrid.addWidget(self.spinVdrop, r, 3)
-        egrid.addWidget(QLabel("过载"), r, 4)
-        self.comboOverload = QComboBox()
-        self.comboOverload.addItems([t for t, _ in OVERLOAD_OPTIONS])
-        self.comboOverload.setCurrentIndex(1)   # 110%
-        egrid.addWidget(self.comboOverload, r, 5)
-        r += 1
-
-        # 行 5：键盘输入自动应用状态（需求 4，轻量提示）
+        # ---- 折叠条 ----
+        eng_bar = QHBoxLayout()
+        eng_bar.setContentsMargins(0, 0, 0, 0)
+        eng_bar.setSpacing(8)
+        self.engToggle = QToolButton()
+        self.engToggle.setText("▸ 工程参数设置")
+        self.engToggle.setCheckable(True)
+        self.engToggle.setStyleSheet("QToolButton { border: none; font-weight: 600; }")
+        self.engToggle.toggled.connect(self._on_eng_toggle)
+        eng_bar.addWidget(self.engToggle)
+        eng_bar.addStretch(1)
         self.engStatusLabel = QLabel("")
-        self.engStatusLabel.setStyleSheet("color:#888; font-size:9pt;")
-        egrid.addWidget(self.engStatusLabel, r, 0, 1, 6)
-        eng_row.addWidget(eng_panel, stretch=1)
+        self.engStatusLabel.setObjectName("engStatus")
+        eng_bar.addWidget(self.engStatusLabel)
 
-        # --- 显示选项面板（Phase 8，需求四） ---
-        disp_panel = QGroupBox("显示选项")
-        disp_panel.setFont(QFont(qt_font_family() or "", 10, QFont.Bold))
-        dbox = QVBoxLayout(disp_panel)
-        dbox.setContentsMargins(10, 10, 10, 8)
-        dbox.setSpacing(4)
+        # ---- 显示选项 Popup（需求六） ----
+        self.dispOptBtn = QToolButton()
+        self.dispOptBtn.setText("显示选项 ▾")
+        self.dispOptBtn.setPopupMode(QToolButton.InstantPopup)
+        self.dispOptBtn.setStyleSheet("QToolButton { border: 1px solid #E2E8F0; border-radius: 4px; padding: 2px 8px; }")
+        dispMenu = QMenu(self.dispOptBtn)
+        dispWidget = QWidget()
+        dispLay = QVBoxLayout(dispWidget)
+        dispLay.setContentsMargins(8, 4, 8, 4)
+        dispLay.setSpacing(4)
         self.cbRefQ = QCheckBox("预设参考 Q 曲线")
         self.cbRefQ.setChecked(True)
         self.cbBoundary = QCheckBox("阻容分界线")
@@ -564,21 +884,108 @@ class MainWindow(QMainWindow):
         self.cbMRange.setChecked(False)
         self.cbFnRange = QCheckBox("fnmin ~ fnmax 范围")
         self.cbFnRange.setChecked(False)
-        for w in (self.cbRefQ, self.cbBoundary, self.cbMRange, self.cbFnRange):
-            dbox.addWidget(w)
-        note = QLabel("恒显：当前 Q / fnp / fnr=1 / 工作点 fn / 增益峰值",
-                      wordWrap=False)
-        note.setStyleSheet("color:#666;")
-        dbox.addWidget(note)
-        dbox.addStretch(1)
-        eng_row.addWidget(disp_panel, stretch=0)
+        dispLay.addWidget(self.cbRefQ)
+        dispLay.addWidget(self.cbBoundary)
+        dispLay.addWidget(self.cbMRange)
+        dispLay.addWidget(self.cbFnRange)
+        dispAction = QWidgetAction(dispMenu)
+        dispAction.setDefaultWidget(dispWidget)
+        dispMenu.addAction(dispAction)
+        self.dispOptBtn.setMenu(dispMenu)
+        eng_bar.addWidget(self.dispOptBtn)
+        engDrawerLay.addLayout(eng_bar)
 
-        root.addLayout(eng_row, stretch=0)
+        # ---- 控件工厂 ----
+        def spin(dec, lo, hi, val, st=1.0):
+            sb = QDoubleSpinBox()
+            sb.setDecimals(dec)
+            sb.setRange(lo, hi)
+            sb.setValue(val)
+            sb.setSingleStep(st)
+            sb.setKeyboardTracking(False)
+            sb.setMinimumWidth(72)
+            sb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            return sb
+
+        def combo(items, index=0):
+            cb = QComboBox()
+            cb.addItems(list(items))
+            cb.setCurrentIndex(index)
+            cb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            # 需求 2.3：按最长 item 文本计算最小宽度（文本 + 左右 padding +
+            # 下拉箭头 + 安全余量），保证"中心抽头同步整流"等完整显示。
+            fm = cb.fontMetrics()
+            longest = max((fm.horizontalAdvance(t) for t in items), default=0)
+            cb.setMinimumWidth(int(longest) + 8 + 8 + 18 + 12)
+            # Popup 列表本身也要足够宽，避免出现"中心抽头...管整流"
+            cb.view().setMinimumWidth(int(longest) + 40)
+            return cb
+
+        self.spinVinMin = spin(1, 1.0, 1e5, DEFAULT_VIN_MIN, 5.0)
+        self.spinVinNom = spin(1, 1.0, 1e5, DEFAULT_VIN_NOM, 5.0)
+        self.spinVinMax = spin(1, 1.0, 1e5, DEFAULT_VIN_MAX, 5.0)
+        self.spinVo = spin(2, 0.1, 1e4, DEFAULT_VO, 1.0)
+        self.spinPout = spin(1, 0.1, 1e7, DEFAULT_POUT, 10.0)
+        self.spinIo = spin(2, 0.01, 1e6, DEFAULT_IO, 1.0)
+        self.spinN = spin(3, 0.01, 1e4, DEFAULT_N, 0.5)
+        self.spinEta = spin(3, 0.01, 1.0, DEFAULT_ETA, 0.01)
+        self.spinVdrop = spin(3, 0.0, 5.0, DEFAULT_VF, 0.05)
+        self.comboBridge = combo([t for t, _ in BRIDGE_OPTIONS], 0)
+        self.comboRect = combo([t for t, _ in RECT_OPTIONS], 1)
+        self.comboTurn = combo(["自动", "手动"], 0)
+        self.comboQMode = combo(["手动", "自动推荐"], 0)
+        self.comboOverload = combo([t for t, _ in OVERLOAD_OPTIONS], 1)
+        self.spinN.setEnabled(False)
+
+        # ---- 展开内容：FieldPair 布局（需求 2.1/2.2/5），3 行 ----
+        self.engContent = QWidget()
+        self.engContent.setVisible(False)  # 默认折叠（需求 3.1）
+        eg = QGridLayout(self.engContent)
+        eg.setContentsMargins(0, 8, 0, 4)
+        eg.setHorizontalSpacing(12)
+        eg.setVerticalSpacing(6)
+
+        def field(label_text, control):
+            return FieldPair(label_text, control)
+
+        # 第 0 行：输入/输出规格（6 项）
+        eg.addWidget(field("Vin_min", self.spinVinMin), 0, 0)
+        eg.addWidget(field("Vin_nom", self.spinVinNom), 0, 1)
+        eg.addWidget(field("Vin_max", self.spinVinMax), 0, 2)
+        eg.addWidget(field("Vo", self.spinVo), 0, 3)
+        eg.addWidget(field("Pout", self.spinPout), 0, 4)
+        eg.addWidget(field("Io", self.spinIo), 0, 5)
+
+        # 第 1 行：拓扑/整流/匝比（4 项）
+        eg.addWidget(field("拓扑", self.comboBridge), 1, 0)
+        eg.addWidget(field("整流", self.comboRect), 1, 1)
+        eg.addWidget(field("匝比模式", self.comboTurn), 1, 2)
+        eg.addWidget(field("n", self.spinN), 1, 3)
+
+        # 第 2 行：Q 模式/效率/压降/过载（4 项）
+        eg.addWidget(field("Q模式", self.comboQMode), 2, 0)
+        eg.addWidget(field("η", self.spinEta), 2, 1)
+        eg.addWidget(field("Vf", self.spinVdrop), 2, 2)
+        eg.addWidget(field("过载", self.comboOverload), 2, 3)
+
+        for c in range(6):
+            eg.setColumnStretch(c, 1)
+
+        engDrawerLay.addWidget(self.engContent)
+        root.addWidget(self.engPanel, stretch=0)
+
+        # 恢复折叠状态（需求 3.1：默认折叠；QSettings 有记录则恢复）
+        settings = QSettings("XDU", "LLCGainCurve")
+        eng_expanded = settings.value("eng_expanded", False, type=bool)
+        self.engToggle.setChecked(eng_expanded)
 
         # ---------- 信号 ----------
         # valueChanged 只记录最新目标参数 + 置 dirty，不直接刷新
         self.sliderK.valueChanged.connect(self._on_k_changed)
         self.sliderQ.valueChanged.connect(self._on_q_changed)
+        # 需求 5.1/5.2：Q 数字输入 ↔ 滑块双向同步（防信号环 + 300ms debounce）
+        self.spinQ.lineEdit().textEdited.connect(self._on_q_text_edited)
+        self.spinQ.editingFinished.connect(self._on_spin_q_commit)
         self.sliderFn.valueChanged.connect(self._on_fn_changed)
         self.editFr.valueChanged.connect(self._on_fr_changed)
         self.editYmax.valueChanged.connect(self._on_ymax_changed)
@@ -638,14 +1045,44 @@ class MainWindow(QMainWindow):
         self.dirty_ylim = True
         self._schedule_refresh()
 
-    def _on_slider_pressed(self, *_):
-        """滑块按下：进入拖动节流模式（需求 5.3 / 6.2）+ 参考族 preview 采样（需求 6.4）。
+    # ---- Q 数字输入 ↔ 滑块双向同步（需求 5.1/5.2/5.3） ----
+    def _on_q_text_edited(self, *_):
+        """Q 输入框键盘编辑：300ms 内自动生效，无需失焦。"""
+        self._q_debounce.start()
 
-        拖动期间曲线/顶部状态实时更新；完整工程计算与长结果文本按
-        ``RESULT_THROTTLE_MS`` 节流，松手时立即最终刷新。
+    def _on_spin_q_commit(self, *_):
+        """Q 输入框 Enter/失焦：立即生效。"""
+        self._q_debounce.stop()
+        self._commit_q_spin()
+
+    def _commit_q_spin(self):
+        """把输入框 Q 值写回滑块（防信号环）；自动推荐模式下手改 Q 则切回手动。"""
+        q = float(self.spinQ.value())
+        sv = _slider_from_log(q, Q_MIN, Q_MAX)
+        sv = min(max(sv, 0), SLIDER_STEPS)
+        if sv == self.sliderQ.value():
+            # 值未变：无操作（但保持 UI 一致）
+            return
+        if getattr(self, "comboQMode", None) is not None \
+                and self.comboQMode.currentIndex() == 1:
+            # 需求 5.3：自动推荐态下用户主动手改 Q → 切回手动，避免"显示自动实际手动"
+            self.comboQMode.setCurrentIndex(0)   # 触发 _on_qmode_changed
+        self.sliderQ.blockSignals(True)
+        self.sliderQ.setValue(sv)
+        self.sliderQ.blockSignals(False)
+        self.dirty_q = True
+        self._schedule_refresh()
+
+    def _on_slider_pressed(self, *_):
+        """滑块按下：进入拖动节流模式（需求 5.3 / 6.2）。
+
+        仅 K 滑块进入参考族 preview 采样（需求 1.3：family 只随 K 变化，
+        Q/fn 拖动不触碰 preview 状态）。拖动期间曲线/顶部状态实时更新；
+        完整工程计算与长结果文本按 ``RESULT_THROTTLE_MS`` 节流。
         """
         self._dragging = True
-        self.plot.set_preview(True)
+        if self.sender() is self.sliderK:
+            self.plot.set_preview(True)
 
     def _on_result_timer(self):
         """拖动节流计时器：做一次完整工程计算 + 长结果文本刷新。"""
@@ -657,10 +1094,11 @@ class MainWindow(QMainWindow):
         拖动期间 valueChanged 已把最新目标参数写入各自 dirty flag；若最后一个
         valueChanged 还未被合并计时器 flush，这里补一次；若已 flush，则各 dirty
         均为 False，执行一次极轻量的纯文本/元数据刷新即可。绝不在这里全量重算
-        曲线族，避免"松手顿一下"。
+        工程数值（除 K 释放退出 preview 时重建一次参考族），避免"松手顿一下"。
         """
         self._dragging = False
-        self.plot.set_preview(False)
+        if self.sender() is self.sliderK:
+            self.plot.set_preview(False)
         self._result_timer.stop()
         if self._perf_log and self._perf:
             self._dump_perf()
@@ -745,11 +1183,6 @@ class MainWindow(QMainWindow):
     def _set_eng_status(self, text: str) -> None:
         if hasattr(self, "engStatusLabel"):
             self.engStatusLabel.setText(text)
-
-    def _on_detail_toggle(self, checked: bool) -> None:
-        """详细信息展开/折叠（需求 5.1）。"""
-        self.detailBox.setVisible(checked)
-        self.detailToggle.setText("详细信息 ▲" if checked else "详细信息 ▼")
 
     def _on_turn_changed(self, *_):
         self._apply_turn_enabled()
@@ -893,7 +1326,10 @@ class MainWindow(QMainWindow):
 
         # 数值标签
         self.labelK.setText(f"{k_ratio:.3f}")
-        self.labelQ.setText(f"{q_cur:.4f}")
+        # 需求 5.1：滑块 → spinQ 实时同步（blockSignals 防环）
+        self.spinQ.blockSignals(True)
+        self.spinQ.setValue(q_cur)
+        self.spinQ.blockSignals(False)
         self.labelFn.setText(f"{fn_work:.4f}")
 
         # 顶部标题状态栏：固定标题 + 动态参数（含 M(fn)，拖动时实时更新）
@@ -926,51 +1362,59 @@ class MainWindow(QMainWindow):
             self._perf["frames"] += 1
 
     # ------------------------------------------------------------------
-    # 右侧结果文本（需求 5.1 分层 + 5.2 滚动位置保持）
+    # 右侧结果（需求五/六/十）：单一滚动区；卡片只更新 QLabel，不重建。
     # ------------------------------------------------------------------
-    def _snapshot_result_scroll(self) -> dict:
-        vsb = self.resultBox.verticalScrollBar()
-        hsb = self.resultBox.horizontalScrollBar()
-        return {
-            "v": vsb.value(),
-            "at_bottom": vsb.maximum() > 0 and vsb.value() >= vsb.maximum() - 1,
-            "h": hsb.value(),
-        }
-
-    def _restore_result_scroll(self, snap: dict) -> None:
-        vsb = self.resultBox.verticalScrollBar()
-        hsb = self.resultBox.horizontalScrollBar()
-        if snap["at_bottom"]:
-            vsb.setValue(vsb.maximum())
-        else:
-            vsb.setValue(min(snap["v"], vsb.maximum()))
-        hsb.setValue(min(snap["h"], hsb.maximum()))
-
-    def _set_result_text(self, box: QPlainTextEdit, text: str) -> None:
-        """设置文本并保持滚动位置（需求 5.2）：不因参数变化跳回顶部。"""
-        snap = self._snapshot_result_scroll() if box is self.resultBox else None
-        box.setPlainText(text)
-        if snap is not None:
-            self._restore_result_scroll(snap)
-
     def _update_result_text(self, values: dict) -> None:
-        """默认【关键结果】精简区 + 精简分析/建议；详细信息在可展开区。"""
-        text = format_key_results(values, self._engine, self._stress)
-        if self._engine_ok and self._engine and self._stress:
-            text += "\n\n" + format_short_analysis(self._engine, self._stress)
-            text += "\n\n" + format_short_suggestions(self._engine)
-        elif self._engine_error:
-            text += "\n\n⚠ 工程参数无效：{:}\n（已保留上一套有效结果，输入会标红提示）".format(
-                self._engine_error)
-        if text != self._last_applied:
-            self._set_result_text(self.resultBox, text)
-            self._last_applied = text
-        # 详细信息区（若已展开）同步刷新：以开关状态为准（isVisible 依赖窗口显示，
-        # 离屏测试/未 show 时不可靠）
-        if self.detailToggle.isChecked():
-            self._set_result_text(
-                self.detailBox,
-                format_detail_results(values, self._engine, self._stress))
+        """更新右侧结果卡片（就地更新 value QLabel，对象身份稳定）。
+
+        用 ``build_result_cards`` 结构化数据一次写入；卡片的合并文本供
+        ``toPlainText()`` 兼容旧断言。
+        """
+        cards = build_result_cards(
+            values, self._engine, self._stress,
+            engine_ok=self._engine_ok, engine_error=self._engine_error)
+        combined = self.resultBox.set_cards(cards)
+        if combined != self._last_applied:
+            self._last_applied = combined
+
+    # ------------------------------------------------------------------
+    # 工程参数区响应式（需求十三）：宽敞 4 列并排，窄小 2×2；无水平滚动条。
+    # ------------------------------------------------------------------
+    def _on_eng_toggle(self, checked: bool) -> None:
+        """工程参数抽屉展开/折叠（需求三）。折叠只影响 UI，不影响数学。"""
+        self.engToggle.setText(("▾ 工程参数设置" if checked else "▸ 工程参数设置"))
+        self.engContent.setVisible(checked)
+        # 强制重布局，使 engPanel 高度立即收缩/展开
+        self.engPanel.updateGeometry()
+        cw = self.centralWidget()
+        if cw.layout():
+            cw.layout().activate()
+        QApplication.processEvents()
+        # 持久化状态（需求 3.1）
+        QSettings("XDU", "LLCGainCurve").setValue("eng_expanded", checked)
+
+    def _toggle_result_sidebar(self) -> None:
+        """结果侧栏折叠/展开（需求 3/4）。
+
+        折叠时**只隐藏 resultBox**，Sidebar 收窄为 ~22~24px 的窄控制条；
+        恢复按钮（resultCollapseBtn）始终可见，因此折叠后仍能一键恢复。
+        展开时恢复之前的结果区宽度。
+        """
+        if self._sidebar_expanded:
+            self._sidebar_expanded = False
+            self._result_sizes = self.splitter.sizes()
+            self.resultBox.setVisible(False)
+            self.resultCollapseBtn.setText("»")
+            self.rightWidget.setMinimumWidth(22)
+            self.rightWidget.setMaximumWidth(24)
+        else:
+            self._sidebar_expanded = True
+            self.rightWidget.setMinimumWidth(300)
+            self.rightWidget.setMaximumWidth(370)
+            self.resultBox.setVisible(True)
+            self.resultCollapseBtn.setText("«")
+            if self._result_sizes:
+                self.splitter.setSizes(self._result_sizes)
 
     def _clear_dirty(self):
         self.dirty_k = False
@@ -1165,6 +1609,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyleSheet(APP_QSS)   # 需求九：Windows 11 / Fluent 风格全局皮肤（必须应用才生效）
     _timing_mark("t1_qapp")
     family = qt_font_family()
     if family:

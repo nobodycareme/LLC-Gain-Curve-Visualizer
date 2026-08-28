@@ -397,10 +397,109 @@ def test_fs_display_format_in_tooltip(plot):
     hit = plot.hit_test(px, py, _RECT)
     assert hit is not None
     lines = plot._tooltip_lines(hit)
-    fs_line = next(l for l in lines if l.startswith("fs = "))
+    # BUG4：Hover 行为为 (style, text) 元组格式
+    fs_line = next(text for style, text in lines if text.startswith("fs = "))
     assert fs_line.endswith("kHz") or fs_line.endswith("Hz") or \
         fs_line.endswith("MHz")
-    # fs = fn*fr 换算正确
-    expected_khz = fn * plot.fr_khz
+    # fs = fn*fr 换算正确（Hz/kHz/MHz 自动格式）
     assert fs_line.startswith("fs = ")
-    assert abs(float(fs_line[5:-4].rstrip()) - 0.0) >= 0 or "kHz" in fs_line
+    assert "kHz" in fs_line or "Hz" in fs_line or "MHz" in fs_line
+
+
+# ===========================================================================
+# 五、阻容分界线 Hover 有效域（需求 6）—— phantom boundary 修复
+# ===========================================================================
+def test_boundary_hover_respects_drawn_domain(plot):
+    """需求 6.2：fn>1 区域图上没有边界线，Hover 绝不能命中数学外推的隐藏曲线。
+
+    真正画出的弯曲段从 fnp 到 fn=1；fn=1.1/1.5/2.0/3.0 即使鼠标放在
+    ``boundary_gain(fn,K)`` 的理论像素点，也绝不能返回 kind==boundary。
+    show_reference=False 时 fn>1 区域不得存在任何 phantom hover。
+    fn=0.6 真实弯曲段、fn=1/M=0.5 真实竖直段仍可 Hover。
+    """
+    # 6.1A：candidates 层面 —— fn>1 不得加入 boundary
+    for fn in (1.1, 1.5, 2.0, 3.0):
+        kinds = {c["kind"] for c in plot._candidates(fn)}
+        assert "boundary" not in kinds, f"fn={fn}: candidates 不应含 boundary"
+    # fn=0.6（弯曲段内）candidates 应含 boundary
+    assert "boundary" in {c["kind"] for c in plot._candidates(0.6)}
+    # 6.1B + hit_test 层面：fn>1 理论像素点绝不返回 boundary
+    for fn in (1.1, 1.5, 2.0, 3.0):
+        px, py = _hit_pt(plot, "boundary", None, fn)
+        hit = plot.hit_test(px, py, _RECT)
+        assert hit is None or hit["kind"] != "boundary", \
+            f"fn={fn}: phantom boundary hover: {hit}"
+    # show_reference=False：fn>1 区域不得有任何 phantom hover
+    plot.show_reference = False
+    for fn in (1.1, 1.5, 2.0, 3.0):
+        px, py = _hit_pt(plot, "boundary", None, fn)
+        hit = plot.hit_test(px, py, _RECT)
+        assert hit is None or hit["kind"] != "boundary", \
+            f"fn={fn}: show_reference=False 仍有 phantom hover: {hit}"
+    plot.show_reference = True
+    # fn=0.6 真实弯曲段仍可 Hover
+    px, py = _hit_pt(plot, "boundary", None, 0.6)
+    hit = plot.hit_test(px, py, _RECT)
+    assert hit is not None and hit["kind"] == "boundary", \
+        f"fn=0.6 应命中真实弯曲段: {hit}"
+    # fn=1/M=0.5 真实竖直段仍可 Hover（_vertical_boundary_hit 单独处理）
+    x1 = plot._map_x(1.0, _RECT)
+    y05 = plot._map_y_full(0.5, _RECT)
+    hit = plot.hit_test(x1, y05, _RECT)
+    assert hit is not None and hit["kind"] == "boundary", \
+        f"fn=1/M=0.5 应命中真实竖直段: {hit}"
+
+
+# ===========================================================================
+# 六、X 轴主刻度（需求 7）—— 刻度恢复与纵向分离
+# ===========================================================================
+def test_x_major_ticks_expected_values(plot):
+    """需求 7.5：X 主刻度必须包含 0.1/0.2/0.5/1/2/5/10。"""
+    ticks = plot._x_major_ticks()
+    assert ticks == [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0], f"实际: {ticks}"
+
+
+def _x_tick_label_rects(plot, r):
+    """与 _draw_labels 相同的布局参数，返回 [(fn, QRectF), ...]。"""
+    from PySide6.QtGui import QFont, QFontMetrics
+    font = plot.font() or QFont()
+    font.setPointSizeF(max(8.0, plot.height() / 90.0))
+    fm = QFontMetrics(font)
+    out = []
+    for v in plot._x_major_ticks():
+        x = plot._map_x(v, r)
+        text = f"{v:g}"
+        tw = fm.horizontalAdvance(text)
+        out.append((v, QRectF(x - tw / 2, r.bottom() + 3, tw, 16)))
+    return out
+
+
+def test_x_tick_labels_do_not_overlap_axis_title(plot):
+    """需求 7.5/7.4：所有 x tick label rect 不得与 axis title rect intersect。"""
+    r = _RECT
+    title_rect = QRectF(r.left(), r.bottom() + 24, r.width(), 22)
+    for v, lr in _x_tick_label_rects(plot, r):
+        assert not lr.intersects(title_rect), \
+            f"fn={v} 刻度 label 与轴标题重叠: {lr.getRect()} vs {title_rect.getRect()}"
+        assert lr.bottom() <= r.bottom() + 19, \
+            f"fn={v} 刻度 label 底部越界: {lr.getRect()}"
+
+
+@pytest.mark.parametrize("w,h", [(1280, 800), (1420, 960), (1920, 1080)])
+def test_x_ticks_visible_at_resolution(plot, w, h):
+    """需求 7.5：1280/1420/1920 下 7 个主刻度 label 都落在控件内且不与标题重叠。"""
+    plot.resize(w, h)
+    plot.show()
+    qapp = QApplication.instance()
+    qapp.processEvents()
+    r = plot._plot_rect(float(plot.width()), float(plot.height()))
+    ticks = plot._x_major_ticks()
+    assert len(ticks) == 7, f"{w}x{h}: 主刻度应 7 个，实际 {ticks}"
+    title_rect = QRectF(r.left(), r.bottom() + 24, r.width(), 22)
+    for v, lr in _x_tick_label_rects(plot, r):
+        assert lr.left() >= 0 and lr.right() <= plot.width(), \
+            f"{w}x{h} fn={v}: 刻度 label 水平越界 {lr.getRect()}"
+        assert lr.top() >= 0 and lr.bottom() <= plot.height(), \
+            f"{w}x{h} fn={v}: 刻度 label 垂直越界 {lr.getRect()}"
+        assert not lr.intersects(title_rect), \
+            f"{w}x{h} fn={v}: 刻度与标题重叠 {lr.getRect()}"

@@ -276,10 +276,8 @@ def test_rectifier_combobox_chinese_labels(win):
     win._engine_dirty = True
     win._do_update()
     assert win._engine["rect"] == "fb_diode"
-    # 结果区显示中文
-    win.detailToggle.setChecked(True)
-    win._do_update()
-    assert "全桥二极管整流" in win.detailBox.toPlainText()
+    # 结果区显示中文（整流方式进入工程卡片/结果文本）
+    assert "全桥二极管整流" in win.resultBox.toPlainText()
 
 
 # ---------------------------------------------------------------------------

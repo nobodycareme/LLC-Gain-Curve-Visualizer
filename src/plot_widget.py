@@ -116,6 +116,17 @@ HOVER_TOL_PX = 8.0
 #: 多曲线几乎重合（< 1px 差）时的优先级：数值越小越优先
 _HOVER_PRIORITY = {"current": 0, "boundary": 1, "family": 2}
 
+# ---- Hover 工程信息卡配色（需求 4：高对比、清晰层级，但不花哨） ----
+# 与曲线的 Q family 配色体系完全无关，仅作用于 Hover 卡片本身。
+HP_CARD_BG    = QColor(255, 255, 255, 246)   # 近白略灰，基本不透明
+HP_CARD_LINE  = QColor(148, 163, 184)        # #94A3B8 边框
+HP_HEADER     = QColor(37, 99, 235)          # #2563EB 标题
+HP_TEXT       = QColor(31, 41, 55)           # #1F2937 正文
+HP_BOLD       = QColor(15, 23, 42)           # 近黑，fn/M 醒目
+HP_SEC        = QColor(100, 116, 139)        # #64748B 次要
+HP_BADGE_IN   = QColor(21, 128, 61)          # #15803D 感性(蓝绿)
+HP_BADGE_CAP  = QColor(217, 119, 6)          # #D97706 容性(橙)
+
 
 def _hex(color: str) -> QColor:
     return QColor(color)
@@ -192,6 +203,15 @@ class GainPlotWidget(QWidget):
 
         self.family_y = [[nan] * n for _ in Q_FAMILY]
         self.current_y = [nan] * n
+        # ---- 拖动 preview 独立数据缓冲（需求 1：绝不污染正式 family_y） ----
+        # preview 用降采样点独立数组，K 拖动时只填充这些点；正式 family_y 保持
+        # full-resolution 纯净。松开 K 后 _compute_family(full) 一次完整重算，
+        # 从数据层面杜绝"新旧 K 值周期交错"导致的彩色色带。
+        self.preview_step = 4
+        self.family_preview_x = self.fn_curve[::self.preview_step]
+        self.fn2_p = self.fn2[::self.preview_step]
+        self.fn2m1_p = self.fn2m1[::self.preview_step]
+        self.family_preview_y = [[nan] * len(self.family_preview_x) for _ in Q_FAMILY]
         self.boundary_x: list = []
         self.boundary_y: list = []
         #: 阻容分界线竖直段（fn=1、M=1→0），见 _compute_boundary
@@ -306,23 +326,31 @@ class GainPlotWidget(QWidget):
     def _compute_family(self, k_ratio: float, preview: bool = False) -> None:
         """参考 Q 曲线族显示数据。
 
-        ``preview=True``（需求 6.4 拖动中）：只算每 4 个采样点（3000→750），
-        其余索引保留旧值（路径按 step=4 只读新算点），把 9 条参考族的增益计算
-        降到约 1/4。数学精度不受影响（峰值/边界/Hover 用精确公式）。
+        ``preview=True``：**只**写入独立的 ``family_preview_y`` 降采样数组，
+        绝不触碰 full-resolution 的 ``family_y``（需求 1 数据隔离）。
+        ``preview=False``：完整重算正式 ``family_y``（3000 点/条）。
         """
         if preview:
-            step = 4
-            n = len(self.fn_curve)
-            for y, q in zip(self.family_y, Q_FAMILY):
-                new = llc_gain_from_parts(
-                    self.fn_curve[::step], self.fn2[::step],
-                    self.fn2m1[::step], k_ratio, q)
-                for j, v in enumerate(new):
-                    y[j * step] = float(v)
-        else:
-            for y, q in zip(self.family_y, Q_FAMILY):
-                new = llc_gain_from_parts(self.fn_curve, self.fn2, self.fn2m1, k_ratio, q)
-                y[:] = [float(v) for v in new]
+            self._compute_family_preview(k_ratio)
+            return
+        for y, q in zip(self.family_y, Q_FAMILY):
+            new = llc_gain_from_parts(self.fn_curve, self.fn2, self.fn2m1, k_ratio, q)
+            y[:] = [float(v) for v in new]
+        self.stats["family"] += 1
+        self.rebuild["family_path"] += 1  # 数据变了，路径需重建
+        self._base_dirty = True
+
+    def _compute_family_preview(self, k_ratio: float) -> None:
+        """K 拖动 preview：只填充独立降采样数组 ``family_preview_y``。
+
+        数据与 ``family_y`` 完全分离，从源头杜绝新旧 K 值交错污染。
+        ``family_preview_x`` / ``fn2_p`` / ``fn2m1_p`` 在构造时按同一 ``preview_step``
+        采样，数学公式与全精度一致（仅点数 3000→750）。
+        """
+        for y, q in zip(self.family_preview_y, Q_FAMILY):
+            new = llc_gain_from_parts(
+                self.family_preview_x, self.fn2_p, self.fn2m1_p, k_ratio, q)
+            y[:] = [float(v) for v in new]
         self.stats["family"] += 1
         self.rebuild["family_path"] += 1  # 数据变了，路径需重建
         self._base_dirty = True
@@ -515,20 +543,23 @@ class GainPlotWidget(QWidget):
         return changed or values_changed
 
     def set_preview(self, preview: bool) -> None:
-        """拖动 preview 模式（需求 6.4）。
+        """拖动 preview 模式。
 
-        ``True``：参考族用降采样绘制（见 ``_compute_family`` / ``_ensure_static_paths``），
-        当前曲线保持全精度；``False``：恢复全精度并强制重建参考族路径。
-        只影响显示采样，不重算任何 LLC 数学数据。
+        ``True``：参考族使用独立降采样 ``family_preview_y``（见 ``_compute_family_preview``），
+        当前曲线保持全精度；``False``：**完整重算一次正式 ``family_y``**（3000 点/条），
+        清零/忽略 preview 数据，杜绝新旧 K 值交错（需求 1 彩色色带根因）。
+        只影响显示采样，不重算任何其他 LLC 数学数据。
         """
         preview = bool(preview)
         if preview == self._preview:
             return
         self._preview = preview
-        if not preview:
-            # 退出 preview：路径缓存键含 preview，置空强制按全精度重建
-            self._path_keys["K"] = None
-            self._fam_paths = []
+        if not self._preview:
+            # 需求 1：退出 preview 必须重新生成完整 full-resolution family_y，
+            # 不能被拖动期间的 partial 数据污染。即使参考族隐藏也重算（一次，廉价）。
+            self._compute_family(self.K, preview=False)
+        self._path_keys["K"] = None
+        self._fam_paths = []
         self._invalidate_base_only()
         self.update()
 
@@ -696,7 +727,7 @@ class GainPlotWidget(QWidget):
         """绘图区（顶部留出独立图例 band 防止遮挡核心曲线）。"""
         left = 74.0
         right = 26.0
-        bottom = 46.0
+        bottom = 50.0
         avail_w = max(80.0, w - left - right)
         legend = self._legend_layout(avail_w, float(h))
         top = legend["height"] + 8.0
@@ -830,13 +861,22 @@ class GainPlotWidget(QWidget):
         """
         key = (self.K, preview) + self._geom_key(r)
         if self._path_rect != r or self._path_keys["K"] != key:
-            step = 4 if preview else self._render_step(len(self.fn_curve))
-            disp = self._display_sample(r, step)
-            if self.show_reference:
-                self._fam_paths = [self._build_curve_path(
-                    self.fn_curve, y, r, step, disp) for y in self.family_y]
+            if preview:
+                # 需求 1：preview 状态用独立降采样数组建路径（其 x 采样为
+                # family_preview_x，区别于 fn_curve，故 disp 传 None 逐点映射）。
+                if self.show_reference:
+                    self._fam_paths = [self._build_curve_path(
+                        self.family_preview_x, y, r, 1) for y in self.family_preview_y]
+                else:
+                    self._fam_paths = []
             else:
-                self._fam_paths = []
+                step = self._render_step(len(self.fn_curve))
+                disp = self._display_sample(r, step)
+                if self.show_reference:
+                    self._fam_paths = [self._build_curve_path(
+                        self.fn_curve, y, r, step, disp) for y in self.family_y]
+                else:
+                    self._fam_paths = []
             if self.show_boundary:
                 self._boundary_path = self._build_curve_path(
                     self.boundary_x, self.boundary_y, r, 1)
@@ -931,6 +971,20 @@ class GainPlotWidget(QWidget):
                 if FN_MIN <= v <= FN_MAX:
                     out.append(v)
         return out
+
+    def _x_major_ticks(self):
+        """X 轴主刻度（需求 7.3）：0.1/0.2/0.5/1/2/5/10，筛到当前范围。
+
+        主刻度画 tick mark + 数字 label；次刻度（0.3/0.4/.../9）只画较短 tick。
+        """
+        return [v for v in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
+                if FN_MIN <= v <= FN_MAX]
+
+    def _x_minor_ticks(self):
+        """X 轴次刻度：0.3/0.4/0.6/0.7/0.8/0.9/3/4/6/7/8/9，筛到当前范围。"""
+        return [v for v in (0.3, 0.4, 0.6, 0.7, 0.8, 0.9,
+                            3.0, 4.0, 6.0, 7.0, 8.0, 9.0)
+                if FN_MIN <= v <= FN_MAX]
 
     def _draw_scene_static(self, p: QPainter, r: QRectF) -> None:
         """Layer A：静息基底（背景/网格/坐标轴/图例 + 参考族 + 边界 + fnp/fnr 竖线）。
@@ -1150,13 +1204,18 @@ class GainPlotWidget(QWidget):
         p.setPen(QPen(QColor(40, 40, 40), 1.0))
         p.drawLine(r.left(), r.bottom(), r.right(), r.bottom())
         p.drawLine(r.left(), r.top(), r.left(), r.bottom())
-        # X 主刻度（十进制）
-        for dec in range(-6, 7):
-            v = 10.0 ** dec
-            if FN_MIN <= v <= FN_MAX:
-                x = self._map_x(v, r)
-                p.drawLine(x, r.bottom(), x, r.bottom() + 5)
+        # X 主刻度（需求 7.3）：0.1/0.2/0.5/1/2/5/10，画较长 tick mark
+        p.setPen(QPen(QColor(40, 40, 40), 1.0))
+        for v in self._x_major_ticks():
+            x = self._map_x(v, r)
+            p.drawLine(x, r.bottom(), x, r.bottom() + 6)
+        # X 次刻度（0.3/0.4/.../9）：画较短 tick mark，不显示数字
+        p.setPen(QPen(QColor(90, 90, 90), 0.8))
+        for v in self._x_minor_ticks():
+            x = self._map_x(v, r)
+            p.drawLine(x, r.bottom(), x, r.bottom() + 3)
         # Y 主刻度（nice ticks）
+        p.setPen(QPen(QColor(40, 40, 40), 1.0))
         for v in self._y_ticks():
             y = self._map_y(v, r)
             p.drawLine(r.left() - 5, y, r.left(), y)
@@ -1168,7 +1227,15 @@ class GainPlotWidget(QWidget):
         font.setPointSizeF(max(8.0, self.height() / 90.0))
         p.setFont(font)
         met = p.fontMetrics()
-        p.drawText(QRectF(r.left(), r.bottom() + 8, r.width(), 22),
+        # 横坐标 tick label（需求 7.4）：r.bottom()+3 ~ +19，与轴标题纵向分离
+        for v in self._x_major_ticks():
+            x = self._map_x(v, r)
+            text = f"{v:g}"
+            tw = met.horizontalAdvance(text)
+            p.drawText(QRectF(x - tw / 2, r.bottom() + 3, tw, 16),
+                       Qt.AlignHCenter, text)
+        # 横轴标题（需求 7.4）：r.bottom()+24 ~ +46，位于刻度数字下方
+        p.drawText(QRectF(r.left(), r.bottom() + 24, r.width(), 22),
                    Qt.AlignHCenter, "归一化频率 fn = fs / fr")
         # y 轴标签（旋转）
         p.save()
@@ -1177,15 +1244,6 @@ class GainPlotWidget(QWidget):
         p.drawText(QRectF(-r.height() / 2, 0, r.height(), 22),
                    Qt.AlignHCenter, "增益 Mg")
         p.restore()
-        # x 刻度文字
-        for dec in range(-6, 7):
-            v = 10.0 ** dec
-            if FN_MIN <= v <= FN_MAX:
-                x = self._map_x(v, r)
-                text = f"{v:g}"
-                tw = met.horizontalAdvance(text)
-                p.drawText(QRectF(x - tw / 2, r.bottom() + 6, tw, 16),
-                           Qt.AlignHCenter, text)
         # y 刻度文字（nice ticks）
         for v in self._y_ticks():
             y = self._map_y(v, r)
@@ -1465,11 +1523,23 @@ class GainPlotWidget(QWidget):
         self._hover_rect = None
         self._hover_mouse = None
 
+    def _boundary_visible_domain(self):
+        """阻容分界线弯曲段的可见 fn 域：``boundary_x[0] ~ boundary_x[-1]``。
+
+        真正画出的弯曲段从 fnp 到 fn=1（见 ``_compute_boundary``）；fn>1 区域图上
+        没有边界线，Hover 绝不能对数学外推的隐藏曲线构造候选（需求 6）。
+        """
+        if not self.boundary_x:
+            return None
+        return self.boundary_x[0], self.boundary_x[-1]
+
     def _candidates(self, fn_mouse):
         """返回候选曲线列表（每条含 kind / q / 颜色 / 曲线值函数）。
 
         隐藏层一律不进入候选：关闭参考 Q 曲线族 / 阻容分界线后，Hover 不再命中
         这些已隐藏曲线（与绘图、图例同一 visibility state，见需求二十八）。
+        阻容分界线弯曲段只在**实际画出的 fn 域**（fnp ~ fn=1）内才进入候选，
+        fn>1 的"数学外推隐藏曲线"绝不参与 Hover（需求 6.1A）。
         """
         out = []
         if self.show_reference:
@@ -1478,12 +1548,21 @@ class GainPlotWidget(QWidget):
         out.append({"kind": "current", "q": float(self.Q),
                     "color": CURRENT_COLOR})
         if self.show_boundary:
-            out.append({"kind": "boundary", "q": None, "color": BOUNDARY_COLOR})
+            dom = self._boundary_visible_domain()
+            if dom is not None and dom[0] <= fn_mouse <= dom[1]:
+                out.append({"kind": "boundary", "q": None, "color": BOUNDARY_COLOR})
         return out
 
     def _curve_m_at(self, kind, q, fn_mouse):
-        """某候选曲线在 fn_mouse 处的精确增益（标量，仅 1 个点）。"""
+        """某候选曲线在 fn_mouse 处的精确增益（标量，仅 1 个点）。
+
+        阻容分界线弯曲段只在可见域内求值；fn 超出 ``boundary_x`` 范围时返回
+        None（双保险，需求 6.1B），绝不外推出一条隐藏曲线。
+        """
         if kind == "boundary":
+            dom = self._boundary_visible_domain()
+            if dom is None or not (dom[0] <= fn_mouse <= dom[1]):
+                return None
             m = boundary_gain(fn_mouse, self.K)
             return m
         return float(llc_gain(fn_mouse, self.K, q))
@@ -1571,42 +1650,59 @@ class GainPlotWidget(QWidget):
         return best
 
     def _tooltip_lines(self, hit) -> list:
+        """Hover 信息行：返回 ``(style, text)`` 列表。
+
+        style ∈ {"header", "bold", "normal", "region"}: 驱动颜色/字重层级。
+        """
         if hit["kind"] == "boundary":
             lines = [
-                "阻容分界线",
-                "∠Zin = 0",
-                f"K = {self.K:.3f}",
-                f"fn = {hit['fn']:.4f}",
-                f"Mb = {_fmt_bound_val(hit['mb'])}",
-                f"Qb = {_fmt_bound_val(hit['qb'])}",
+                ("header", "阻容分界线"),
+                ("normal", "∠Zin = 0"),
+                ("normal", f"K = {self.K:.3f}"),
+                ("bold", f"fn = {hit['fn']:.4f}"),
+                ("normal", f"Mb = {_fmt_bound_val(hit['mb'])}"),
+                ("normal", f"Qb = {_fmt_bound_val(hit['qb'])}"),
             ]
         else:
             lines = [
-                f"Q = {hit['q']:.3f}",
-                f"K = {self.K:.3f}",
-                f"fn = {hit['fn']:.4f}",
-                f"M = {hit['m']:.4f}",
+                ("header", "当前曲线"),
+                ("normal", f"Q = {hit['q']:.4f}"),
+                ("normal", f"K = {self.K:.3f}"),
+                ("bold", f"fn = {hit['fn']:.4f}"),
+                ("bold", f"M = {hit['m']:.4f}"),
             ]
-        lines.append(f"fs = {_fmt_freq(hit['fn'] * self.fr_khz * 1000.0)}")
-        lines.append(f"区域：{_REGION_LABEL.get(hit['region'], hit['region'])}")
+        lines.append(
+            ("normal", f"fs = {_fmt_freq(hit['fn'] * self.fr_khz * 1000.0)}"))
+        rlabel = _REGION_LABEL.get(hit["region"], hit["region"])
+        style = "region_inductive" if hit["region"] == "inductive" \
+            else "region_capacitive"
+        lines.append((style, f"区域：{rlabel}"))
         return lines
 
-    def _tooltip_geometry(self, mouse_pos, lines, widget_w, widget_h):
-        """Tooltip 位置：鼠标右上方，空间不足时翻转。返回 (rect, lines)。"""
+    def _tooltip_geometry(self, mouse_pos, n_lines, widget_w, widget_h):
+        """Tooltip 位置：四象限自适应，避免盖住鼠标点。
+
+        优先右上；右边界不足翻到左；上边界不足翻到下；两向都受限时
+        让 tooltip 尽量贴合交点而不遮蔽命中点。
+        """
         font = self._legend_font(float(widget_h))
         met = QFontMetrics(font)
-        pad_x, pad_y = 8, 6
-        line_h = met.height() + 2
-        w = max((met.horizontalAdvance(t) for t in lines), default=80) + 2 * pad_x
-        h = len(lines) * line_h + 2 * pad_y + 4
-        x = mouse_pos.x() + 12
-        y = mouse_pos.y() - 12 - h
-        if x + w > widget_w - 2:
-            x = mouse_pos.x() - 12 - w
-        if y < 2:
-            y = mouse_pos.y() + 14
-        if y + h > widget_h - 2:
-            y = widget_h - 2 - h
+        pad_x, pad_y = 10, 8
+        line_h = met.height() + 3
+        w = 186 + 2 * pad_x
+        h = n_lines * line_h + 2 * pad_y + 6
+        mx, my = mouse_pos.x(), mouse_pos.y()
+        # 优先右上（位于命中点右上方）
+        if mx + 14 + w <= widget_w - 2 and my - 14 - h >= 2:
+            x, y = mx + 14, my - 14 - h
+        elif mx - 14 - w >= 2 and my - 14 - h >= 2:
+            x, y = mx - 14 - w, my - 14 - h
+        elif mx + 14 + w <= widget_w - 2 and my + 12 + h <= widget_h - 2:
+            x, y = mx + 14, my + 12
+        else:
+            x, y = mx - 14 - w, my + 12
+        x = max(2, min(x, int(widget_w) - 2 - w))
+        y = max(2, min(y, int(widget_h) - 2 - h))
         return QRect(int(x), int(y), int(w), int(h))
 
     def _draw_hover(self, p: QPainter, r: QRectF) -> None:
@@ -1624,24 +1720,47 @@ class GainPlotWidget(QWidget):
         p.setPen(QPen(_hex(hit["color"]), 2.2))
         p.drawEllipse(QRectF(px - rad, py - rad, 2 * rad, 2 * rad))
         p.restore()
-        # Tooltip
+
+        # Tooltip 工程信息卡（高对比，需求 4）
         lines = self._tooltip_lines(hit)
-        tg = self._tooltip_geometry(self._hover_mouse, lines,
-                                    float(self.width()), float(self.height()))
+        base_font = self._legend_font(float(self.height()))
+        tg = self._tooltip_geometry(
+            self._hover_mouse, len(lines) + 1, float(self.width()),
+            float(self.height()))
         p.save()
-        p.setFont(self._legend_font(float(self.height())))
-        p.setBrush(QColor(255, 255, 255, 242))
-        p.setPen(QPen(QColor(200, 200, 200), 1.0))
-        p.drawRect(tg)
-        font = self._legend_font(float(self.height()))
-        p.setFont(font)
-        met = QFontMetrics(font)
-        pad_x, pad_y = 8, 6
-        line_h = met.height() + 2
+        met = QFontMetrics(base_font)
+        line_h = met.height() + 3
+        pad_x, pad_y = 10, 8
+        # 阴影（右下轻偏移，低透明黑）
+        sh = QPainterPath()
+        sh.addRoundedRect(QRectF(tg).translated(3, 3), 6, 6)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 30))
+        p.drawPath(sh)
+        # 卡片底 + 边框（圆角 6）
+        card = QPainterPath()
+        card.addRoundedRect(QRectF(tg), 6, 6)
+        p.setPen(QPen(HP_CARD_LINE, 1.0))
+        p.setBrush(HP_CARD_BG)
+        p.drawPath(card)
+        # 文本（按 style 驱动颜色/字重）
         ty = tg.top() + pad_y
-        for line in lines:
+        for style, text in lines:
+            f = QFont(base_font)
+            if style == "header":
+                pen = _hex("#2563EB")
+                f.setBold(True)
+            elif style == "bold":
+                pen = HP_BOLD
+                f.setBold(True)
+            elif style in ("region_inductive", "region_capacitive"):
+                pen = HP_BADGE_IN if style == "region_inductive" else HP_BADGE_CAP
+            else:
+                pen = HP_TEXT
+            p.setFont(f)
+            p.setPen(pen)
             p.drawText(QRectF(tg.left() + pad_x, ty, tg.width() - 2 * pad_x, line_h),
-                       Qt.AlignLeft | Qt.AlignVCenter, line)
+                       Qt.AlignLeft | Qt.AlignVCenter, text)
             ty += line_h
         p.restore()
         # 记录当前 rect 供局部刷新

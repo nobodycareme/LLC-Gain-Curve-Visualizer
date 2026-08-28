@@ -2,7 +2,7 @@
 # 用法: powershell -ExecutionPolicy Bypass -File scripts\build_review_package.ps1
 # 产物: LLC增益曲线_审查包_v<VER>_YYYYMMDD.zip  (项目根目录)
 param(
-    [string]$Ver = "v3",
+    [string]$Ver = "v6",
     [string]$Date = (Get-Date -Format "yyyyMMdd")
 )
 $ErrorActionPreference = "Stop"
@@ -30,6 +30,10 @@ foreach ($f in @("LLC_Gain_Curve.spec", "requirements.txt", "README.md",
                 "OPTIMIZATION_REPORT.md",
                 "LLC工程开发_最终交付报告_20260820.md",
                 "LLC工程开发_问题修复与瘦身_交付报告_20260821.md",
+                "LLC工程开发_UI重构与预览隔离_交付报告_20260821.md",
+                "LLC增益曲线_UI结构收敛_交付报告_20260821.md",
+                "LLC增益曲线_曲线主导重构_交付报告_20260821.md",
+                "LLC增益曲线_v8修复_交付报告_20260822.md",
                 "CHANGELOG.md")) {
     $p = Join-Path $root $f
     if (Test-Path $p) { Copy-Item $p -Destination $stageF -Force }
@@ -52,12 +56,27 @@ Get-ChildItem (Join-Path $root "scripts") -File | Where-Object {
 $distDst = Join-Path $stageF "dist"
 New-Item -ItemType Directory -Path $distDst -Force | Out-Null
 Get-ChildItem (Join-Path $root "dist") -File -Filter "*.exe" | Copy-Item -Destination $distDst -Force
-Copy-Item (Join-Path $root "dist\LLC增益曲线_onedir") -Destination $distDst -Recurse -Force
+$onedir = Join-Path $root "dist\LLC增益曲线_onedir"
+if (Test-Path $onedir) {
+    Copy-Item $onedir -Destination $distDst -Recurse -Force
+}
 
 # ---------- review_shots: 验收场景截图 ----------
 $shotsDst = Join-Path $stageF "review_shots"
 New-Item -ItemType Directory -Path $shotsDst -Force | Out-Null
-Get-ChildItem (Join-Path $root "scripts") -Filter "_sc_*.png" | Copy-Item -Destination $shotsDst -Force
+# 优先使用最新 _accept_v8，回退到 _accept_v7，再回退到 _accept_v6，再回退到 _accept
+$acceptDir = Join-Path $root "_accept_v8"
+if (-not (Test-Path $acceptDir)) { $acceptDir = Join-Path $root "_accept_v7" }
+if (-not (Test-Path $acceptDir)) { $acceptDir = Join-Path $root "_accept_v6" }
+if (-not (Test-Path $acceptDir)) { $acceptDir = Join-Path $root "_accept" }
+if (Test-Path $acceptDir) {
+    Get-ChildItem $acceptDir -File -Filter "*.png" | Copy-Item -Destination $shotsDst -Force
+    # 包含 canvas 尺寸测量数据
+    Get-ChildItem $acceptDir -File -Filter "*.json" | Copy-Item -Destination $shotsDst -Force
+}
+# 同时收集 scripts 下的场景截图
+Get-ChildItem (Join-Path $root "scripts") -Filter "_sc_*.png" -ErrorAction SilentlyContinue |
+    Copy-Item -Destination $shotsDst -Force
 
 # ---------- 生成 SHA-256 清单 ----------
 $relList   = Get-ChildItem $stageF -Recurse -File

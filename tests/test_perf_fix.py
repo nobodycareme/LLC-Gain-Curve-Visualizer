@@ -32,12 +32,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 pytest.importorskip("PySide6", reason="未安装 PySide6，跳过 GUI 性能测试")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QGroupBox, QLabel  # noqa: E402
 
 import main as app_main  # noqa: E402
 from llc_py import (  # noqa: E402
     FN_MIN, FN_MAX, K_MIN, K_MAX, Q_MIN, Q_MAX,
-    llc_gain, Q_FAMILY,
+    llc_gain, llc_gain_from_parts, Q_FAMILY,
 )
 from plot_widget import GainPlotWidget  # noqa: E402
 
@@ -307,12 +307,10 @@ def test_dirty_flags_merge_high_frequency(qapp):
 def test_slider_labels_use_new_symbols(win):
     """使用 QPainter 控件，标签文本为 K = Lm/Lr、fn = fs/fr。"""
     assert isinstance(win.canvas, GainPlotWidget), "主画布应为 QPainter 控件"
-    # 参数定义在"详细信息"区（需求 5.1 分层）
-    win.detailToggle.setChecked(True)
-    win._do_update()
-    text = win.detailBox.toPlainText()
-    assert "K  = Lm / Lr" in text
-    assert "fn = fs / fr" in text
+    # 符号定义直接出现在参数调节区标签（「详细信息」已彻底删除）
+    labels = [l.text() for l in win.findChildren(QLabel) if l.text()]
+    assert any("K = Lm/Lr" in t for t in labels), labels
+    assert any("fn = fs/fr" in t for t in labels), labels
 
 
 def test_no_old_symbols_in_ui(win):
@@ -323,3 +321,124 @@ def test_no_old_symbols_in_ui(win):
     assert "Ln" not in text
     assert "Ln" not in status
     assert "K  = fs / fr" not in text
+
+
+# ---------------------------------------------------------------------------
+# 本轮新增：preview 数据隔离 / Q 数字输入 / 顶部签名 / 卡片结果 / 面板命名
+# ---------------------------------------------------------------------------
+def test_preview_uses_separate_data_array(win):
+    """BUG1 根因回归：K 拖动 preview 只写独立降采样数组，绝不污染正式 family_y。"""
+    win.plot.set_display_state(show_reference=True)
+    win.sliderK.setValue(0)
+    win.dirty_k = True
+    win._do_update()
+    before = win.plot.family_data_y()
+
+    win.plot.set_preview(True)
+    win.sliderK.setValue(700)
+    win.dirty_k = True
+    win._do_update()
+    assert win.plot._preview, "preview 模式应已激活"
+
+    # 正式数组必须保持不变（数据隔离）
+    for old, new_y in zip(before, win.plot.family_data_y()):
+        assert new_y == pytest.approx(old), "preview 不得污染正式 family_y"
+
+    # preview 数组已按新 K 填充，且与公式一致
+    pv = win.plot.family_preview_y
+    assert len(pv) == len(Q_FAMILY)
+    assert len(pv[0]) == len(win.plot.family_preview_x)
+    K = app_main._lin_from_slider(700, K_MIN, K_MAX)
+    expected = llc_gain_from_parts(
+        win.plot.family_preview_x, win.plot.fn2_p, win.plot.fn2m1_p, K, Q_FAMILY[0])
+    assert pv[0] == pytest.approx(expected, rel=1e-9)
+
+
+def test_preview_reduced_sampling_length(win):
+    """preview 参考族为降采样（~1/4 点数），数学曲线仍为全采样。"""
+    assert len(win.plot.family_preview_x) <= len(win.plot.fn_curve) // 4 + 2
+    assert len(win.plot.family_preview_x) < len(win.plot.fn_curve)
+    assert len(win.plot.family_y[0]) == len(win.plot.fn_curve)
+
+
+def test_exit_preview_recomputes_full_family(win):
+    """退出 preview 必须完整重算 full-resolution family_y，无残留稀疏污染。"""
+    win.plot.set_display_state(show_reference=True)
+    win.plot.set_preview(True)
+    win.sliderK.setValue(200)
+    win.dirty_k = True
+    win._do_update()
+
+    win.plot.set_preview(False)
+    # 退出后全采样 family_y 与公式在全 K 下一致（含预览时已写入索引处，无旧值残留）
+    K = app_main._lin_from_slider(win.sliderK.value(), K_MIN, K_MAX)
+    expected = llc_gain_from_parts(
+        win.plot.fn_curve, win.plot.fn2, win.plot.fn2m1, K, Q_FAMILY[0])
+    assert len(win.plot.family_y[0]) == len(win.plot.fn_curve)
+    assert win.plot.family_y[0] == pytest.approx(expected, rel=1e-9)
+
+
+def test_preview_hidden_reference_still_pollution_free(win):
+    """参考族隐藏时 K 拖动 preview 同样不得污染正式 family_y。"""
+    win.plot.set_display_state(show_reference=False)
+    win.sliderK.setValue(0)
+    win.dirty_k = True
+    win._do_update()
+    before = win.plot.family_data_y()
+
+    win.plot.set_preview(True)
+    win.sliderK.setValue(900)
+    win.dirty_k = True
+    win._do_update()
+    assert win.plot._preview
+    for old, new_y in zip(before, win.plot.family_data_y()):
+        assert new_y == pytest.approx(old)
+
+
+def test_top_banner_shows_school_and_name(win):
+    """顶部标题显示学校与姓名。"""
+    assert getattr(win, "centerLabel", None) is not None
+    text = win.centerLabel.text()
+    assert "西安电子科技大学" in text
+    assert "张名扬" in text
+
+
+def test_engineering_panel_renamed(win):
+    """工程参数面板统一命名为“工程参数设置”（折叠条 QToolButton 文字）。"""
+    # "工程参数设置" 现在在折叠条 QToolButton 上，而非 QLabel
+    assert hasattr(win, "engToggle"), "应有工程参数折叠按钮"
+    assert "工程参数设置" in win.engToggle.text(), f"折叠条文字: {win.engToggle.text()}"
+    # 区域以 QFrame 卡片承载，而非旧式 QGroupBox 线框
+    assert len(win.findChildren(QGroupBox)) == 0, "不应再使用传统 QGroupBox 线框"
+
+
+def test_q_spinbox_writes_back_to_slider(win):
+    """Q 数字输入框值写回滑块（双向同步）。"""
+    win.spinQ.setValue(3.21)
+    win._commit_q_spin()
+    q_from_slider = app_main._log_from_slider(win.sliderQ.value(), Q_MIN, Q_MAX)
+    # 滑块为 1000 档连续映射，误差在步长内
+    assert abs(q_from_slider - 3.21) < 0.02
+
+
+def test_q_spinbox_debounce_commit_without_focus(win):
+    """任意输入值在 debounce 后自动提交，无需失焦/Enter。"""
+    win._auto_q_sync = False
+    win.spinQ.setValue(0.85)
+    win._on_q_text_edited()        # 模拟键盘输入，开始 debounce
+    assert win._q_debounce.isActive(), "输入后应启动 debounce 计时"
+    win._q_debounce.stop()
+    win._commit_q_spin()           # 等价 debounce 超时提交
+    q_from_slider = app_main._log_from_slider(win.sliderQ.value(), Q_MIN, Q_MAX)
+    assert abs(q_from_slider - 0.85) < 0.02
+
+
+def test_result_cards_layout_with_chinese_fields(win):
+    """右侧结果区为卡片布局，并含 Re 与中文关键变量名。"""
+    import main as _m
+    assert isinstance(win.resultBox, _m.ResultPanel)
+    win._do_update()
+    text = win.resultBox.toPlainText()
+    assert "所需最小增益" in text and "所需最大增益" in text
+    assert "满载 Q" in text and "过载 Q" in text
+    assert "Re" in text and "Ω" in text

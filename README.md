@@ -2,21 +2,21 @@
 
 # LLC 谐振变换器增益曲线可视化工具
 
-**Interactive FHA Gain-Curve Visualizer for LLC Resonant Converters**
+**LLC FHA Gain-Curve Visualizer — Interactive FHA Gain-Curve Analysis + Engineering Design Aids**
 
 简体中文 | [English](README_EN.md)
 
-[![Latest Release](https://img.shields.io/badge/Release-v1.0.0-blue.svg)](https://github.com/nobodycareme/LLC-Gain-Curve-Visualizer/releases/latest)
+[![Latest Release](https://img.shields.io/badge/Release-v2.0.0-blue.svg)](https://github.com/nobodycareme/LLC-Gain-Curve-Visualizer/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-informational)](#快速下载)
 [![Python](https://img.shields.io/badge/Python-3.10--3.12-3776AB)](requirements.txt)
 [![PySide6](https://img.shields.io/badge/PySide6-6.7%2B-41CD52)](requirements.txt)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-1015%20passed-brightgreen.svg)](#测试与验证)
+[![Tests](https://img.shields.io/badge/Tests-1172%20passed%20%7C%208%20skipped-brightgreen.svg)](#测试与验证)
 [![CI](https://img.shields.io/github/actions/workflow/status/nobodycareme/LLC-Gain-Curve-Visualizer/tests.yml?label=CI)](https://github.com/nobodycareme/LLC-Gain-Curve-Visualizer/actions/workflows/tests.yml)
 [![Status](https://img.shields.io/badge/Status-Stable-brightgreen.svg)](#)
 
-一个用于研究 LLC 谐振变换器 **FHA（基波近似）增益特性** 的交互式 Windows 桌面工具，
-面向电力电子专业学生、开关电源工程师以及 LLC 参数设计与教学活动。
+一个以 **LLC FHA 多增益曲线分析为核心**，并提供工程参数辅助计算与应力估算的
+Windows 桌面工具，面向电力电子专业学生、开关电源工程师以及 LLC 参数设计与教学活动。
 
 </div>
 
@@ -24,11 +24,18 @@
 
 ## 1. 项目简介
 
-本项目是一个用于研究 LLC 谐振变换器 FHA（基波近似, First Harmonic Approximation）
-电压增益特性的交互式 Windows 桌面工具。它基于经典 LLC 基波分析方法，
-将增益 `M(fn, K, Q)` 表示为归一化频率、电感比与品质因数的函数，
-通过实时可调滑块与对数坐标绘制的多曲线族，直观呈现参数变化对增益特性、
-谐振点与感性/容性工作区的影响。
+本项目是一个基于经典 LLC 基波分析（FHA，First Harmonic Approximation）方法的交互式
+Windows 桌面工具。核心是把增益 `M(fn, K, Q)` 表示为归一化频率、电感比与品质因数的函数，
+通过实时可调滑块与对数坐标绘制的多曲线族，直观呈现参数变化对增益特性、谐振点与感性/容性
+工作区的影响；并在曲线分析之上，提供工程参数（输入/输出规格、拓扑、整流、匝比、效率等）
+的**辅助计算、调频范围推导与 FHA 电流/应力估算**。
+
+**软件定位：**
+
+> 这是一款以 **LLC FHA 增益曲线分析** 为核心，并提供工程参数辅助计算与应力估算的
+> Windows 桌面工具。工程参数与应力功能是**辅助设计能力**，核心仍然是增益曲线分析，
+> 用于参数趋势研究、前期设计与教学。它**不是**完整商业级的自动电源设计软件，
+> 也不替代开关级时域仿真与实物验证。
 
 **适用对象：**
 
@@ -38,32 +45,68 @@
 - 面试与课程学习；
 - 初步参数敏感性分析。
 
-> 这是一款**增益曲线可视化与分析工具**，用于参数趋势研究与教学，并非完整的
-> 电源自动设计软件。
-
 ## 2. 界面预览
 
-程序主界面（最终版真实运行截图，含顶部完整图例与品红阻容分界线）：
+程序主界面（v2.0.0 实际 Windows 运行界面，含工程参数辅助设计、结果侧栏与完整曲线信息）：
 
 ![Main interface](docs/images/main-interface.png)
 
 ## 3. 核心功能
 
-- 多条固定参考 Q 曲线（Q = 0.1, 0.2, 0.5, 0.8, 1.0, 2.0, 5.0, 8.0, 10.0）；
-- 当前 Q 曲线突出显示（黑色粗线）；
-- K = Lm/Lr、Q、fn = fs/fr 实时调节；
-- **精确阻容分界线**（感性区 / 容性区边界，见第 5 节）；
-- 感性区 / 容性区实时判断（基于输入阻抗相角 sign(Im(Zin))）；
+### 曲线分析
+
+- K = Lm/Lr 实时调节（拖动 + 数值输入）；
+- Q 滑块 + 数字输入；
+- fn = fs/fr 实时工作点；
+- 多参考 Q 曲线显示 / 隐藏；
+- 当前 Q 曲线（黑色粗线突出）；
 - 并联谐振点 fnp、串联谐振点 fnr = 1 标记；
-- 当前增益峰值搜索（与阻容边界严格区分）；
-- 当前工作点实时标记（随 fn 滑动沿当前曲线移动）；
-- **Curve Hover Inspector**：鼠标悬停任意增益曲线，实时显示该数学点参数
-  （见第 6 节）；
-- 实际开关频率换算（fs = fn · fr）；
-- 中文桌面界面；
-- 对数频率横轴、动态规整 Y 轴刻度、正确对数次网格、完整曲线裁剪；
-- High-DPI 支持；
-- Windows 单文件 EXE（无需 Python，开箱即用）。
+- 增益峰值与当前工作点标记；
+- **精确阻容分界线**（基于 `Im(Zin) = 0`，感性区 / 容性区判别）；
+- **Curve Hover Inspector**：悬停任意曲线实时显示该数学点参数；
+- Mmin~Mmax 工程所需增益范围显示；
+- fnmin~fnmax 调频范围显示；
+- 对数频率坐标与完整横轴刻度（0.1 / 0.2 / 0.5 / 1 / 2 / 5 / 10）；
+- High-DPI 支持。
+
+### 工程辅助设计（默认折叠，曲线优先）
+
+支持输入：
+
+- Vin_min / Vin_nom / Vin_max；
+- Vo；
+- Pout / Io；
+- 拓扑：半桥 / 全桥；
+- 整流：中心抽头 / 全桥 × 二极管 / 同步整流；
+- 自动 / 手动匝比；
+- η；
+- Vf；
+- 过载倍率；
+- 手动 / 推荐 Q。
+
+### 自动计算
+
+- n；
+- RL、Re、Zr；
+- Lr、Lm、Cr；
+- M_req_min、M_req_max；
+- Q_full、Q_overload；
+- fn_min、fn_max、fs_min、fs_max。
+
+### FHA 电流与应力估算
+
+- Ioe、Im、Ir；
+- Cr 电流有效值（Irms）、Cr 峰值电压（Vpeak）；
+- 相关 FHA estimate。
+
+### UI
+
+- 工程参数默认折叠，曲线优先；
+- 结果侧栏可折叠 / 恢复；
+- 显示选项 Popup；
+- 中文现代化界面（Windows 10 / 11 风格）；
+- Windows 10 / 11 x64；
+- 单文件 EXE，无需安装 Python。
 
 ## 4. 数学模型
 
@@ -159,6 +202,8 @@ fs = 72.34 kHz
 - Hover 数值通过数学模型按鼠标横坐标**实时计算**，不依赖最近的离散绘图采样点；
 - 区域判定来自输入阻抗 `Im(Zin)` 的符号，而非图形坐标猜测；
 - 命中容差 8 逻辑像素，天然兼容 High-DPI；
+- 阻容分界线仅在**实际画出**的 fn 域内参与 Hover（fn > 1 区域不会出现"看不见却可
+  Hover"的隐藏曲线）；
 - 数据细节见 [UI_INTERACTION_OPTIMIZATION_REPORT.md](UI_INTERACTION_OPTIMIZATION_REPORT.md)。
 
 ## 7. 参数影响
@@ -180,8 +225,10 @@ fs = 72.34 kHz
 
 - fn 滑动只更新动态 overlay，零曲线重算；
 - Q 滑动只重算当前曲线，参考族与边界不动；
-- K 滑动才重算参考族与边界；
-- 滑块释放不做全量重算，避免"松手顿一下"。
+- K 滑动才重算参考族与边界（拖动过程中预览重算已隔离，避免"拖动 K 后参考曲线
+  变成大片色带"的数据污染）；
+- 滑块释放不做全量重算，避免"松手顿一下"；
+- 工程参数 / 应力重算采用节流合并，避免高频拖动触发无谓计算。
 
 详细技术过程与 benchmark 见
 [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) 与
@@ -189,54 +236,47 @@ fs = 72.34 kHz
 
 ## 9. 快速下载
 
-最新稳定版：**v1.0.0**
+最新稳定版：**v2.0.0**
 
-[![Download](https://img.shields.io/badge/Download-v1.0.0-green.svg)](https://github.com/nobodycareme/LLC-Gain-Curve-Visualizer/releases/latest)
+[![Download](https://img.shields.io/badge/Download-v2.0.0-green.svg)](https://github.com/nobodycareme/LLC-Gain-Curve-Visualizer/releases/latest)
 
-### 普通用户单文件版（推荐）
+### 单文件版（推荐）
 
-资产：`LLC-Gain-Curve-Windows-x64.exe`
+资产：`LLC-Gain-Curve-Visualizer-v2.0.0-Windows-x64.exe`
 
 - 单个 EXE，下载后直接双击运行；
 - 无需安装 Python；
 - 方便下载与分享；
 - 首次启动需解包，启动相对 onedir 稍慢。
 
-### 极速版（onedir）
-
-资产：`LLC-Gain-Curve-Windows-x64-onedir.zip`
-
-- 解压后运行其中的 `LLC增益曲线.exe`；
-- 启动明显更快，适合频繁使用；
-- 目录内包含运行所需 DLL，**必须保持整个解压目录结构完整**，不能只把其中的
-  EXE 单独拿走。
-
-> 两者功能完全一致，仅启动体验与体积形态不同。
+> 本轮 v2.0.0 正式发布仅提供上述单文件 EXE，并附带 `SHA256SUMS.txt` 供完整性校验。
+> GitHub 同时自动提供 `Source code (zip)` / `Source code (tar.gz)`。
 
 ## 10. 使用方法
 
 1. 从 [Releases](https://github.com/nobodycareme/LLC-Gain-Curve-Visualizer/releases/latest)
-   下载 EXE（或 onedir 压缩包）；
+   下载 EXE；
 2. 验证 SHA-256（见 [第 11 节](#11-sha-256-验证)）；
-3. 双击运行（onedir 需先解压）；
+3. 双击运行；
 4. 调节 K、Q、fn 滑块，观察曲线、谐振点、阻容分界线与增益峰值；
-5. 鼠标悬停任意曲线，查看实时精确参数。
+5. 鼠标悬停任意曲线，查看实时精确参数；
+6. 展开工程参数，输入规格，查看自动计算的谐振腔参数、调频范围与 FHA 应力估算。
 
 ## 11. SHA-256 验证
 
 在 PowerShell 中执行：
 
 ```powershell
-Get-FileHash ".\LLC-Gain-Curve-Windows-x64.exe" -Algorithm SHA256
+Get-FileHash ".\LLC-Gain-Curve-Visualizer-v2.0.0-Windows-x64.exe" -Algorithm SHA256
 ```
 
-本项目 v1.0.0 官方发布的 onefile EXE SHA-256：
+本项目 v2.0.0 官方发布的单文件 EXE SHA-256：
 
 ```
-c04a65df0ff98b138b3379236f6a4fa8a441625bcd67c10eeeab4571a54aa099
+21352B869AB3AAC49E2F0B3A9D08DE2E3F2626E85F7A823C13DDA854E4FB28B6
 ```
 
-也可直接比对 Release 附件 `SHA256SUMS.txt` 中记录的 onefile 与 onedir ZIP 的摘要。
+也可直接比对 Release 附件 `SHA256SUMS.txt` 中记录的摘要。
 
 ## 12. Windows 安全提示
 
@@ -273,23 +313,32 @@ scripts\build_exe.bat
 
 ## 15. 测试与验证
 
-本项目使用 **pytest** 进行单元测试、GUI 冒烟、Hover 交互与数值稳定性测试，
-当前 **1015** 项全部通过：
+本项目使用 **pytest** 进行单元测试、GUI 冒烟、Hover 交互、工程设计数学层、
+TI SLUP263 回归与数值稳定性测试，当前 **1172** 项通过、**8** 项跳过、**0** 失败：
 
 | 测试文件 | 用例数 | 覆盖内容 |
 |----------|-------:|----------|
-| `test_llc_model.py` | 233 | FHA 数学模型（增益公式、谐振点、峰值、换算） |
 | `test_boundary_rc.py` | 238 | 阻容分界线（Im(Zin)=0）数学与 GUI |
+| `test_llc_model.py` | 233 | FHA 数学模型（增益公式、谐振点、峰值、换算） |
 | `test_boundary_frequency_stability.py` | 175 | boundary_frequency 极端数值稳定性 |
 | `test_llc_py_crosscheck.py` | 135 | llc_py ↔ llc_model 数值一致性与参考交叉验证 |
 | `test_boundary_frequency_monotonic.py` | 57 | 边界频率单调性与趋势 |
 | `test_llc_plot.py` | 31 | QPainter 绘图层（对象复用、数据更新） |
 | `test_boundary_frequency_reference.py` | 31 | 边界频率高精度参考验证 |
+| `test_ui_interaction.py` | 31 | Hover Inspector / 图例 / Y tick / X 轴刻度 / 分层缓存 |
+| `test_perf_fix.py` | 29 | 性能增量刷新、事件合并、缓存稳定 |
 | `test_gui_smoke.py` | 28 | GUI 冒烟（窗口、参数交互、重入保护） |
-| `test_ui_interaction.py` | 25 | Hover Inspector / 图例 / Y tick / 分层缓存 |
+| `test_llc_design.py` | 26 | 工程设计（n / Re / Zr / Lr / Lm / Cr 自动计算） |
+| `test_edgecases_phase1.py` | 25 | Phase 1 边界/极端输入用例 |
+| `test_ui_structure.py` | 24 | UI 结构、结果侧栏、FieldPair 几何无重叠、无"详细信息"残留 |
 | `test_boundary_frequency_tricky.py` | 23 | 边界频率边界值（Q=0、极大 K/Q） |
-| `test_perf_fix.py` | 20 | 性能增量刷新、事件合并、缓存稳定 |
+| `test_regression_fixes.py` | 21 | 多处 GUI/数学回归修复、photon boundary Hover 域 |
+| `test_engineering_gui.py` | 14 | 工程设计与显示开关 GUI |
+| `test_llc_stress.py` | 12 | FHA 电流/应力估算（Ioe/Im/Ir/Cr） |
 | `test_boundary_gui.py` | 11 | 阻容边界 GUI 视觉与内容 |
+| `test_llc_solver.py` | 11 | fn 求解器（工作点 / 调频范围） |
+| `test_ti_slup263.py` | 9 | TI SLUP263 官方设计步骤回归 |
+| `test_exe_package_audit.py` | 8 | 冻结 EXE 打包审计（无多余 Qt 组件） |
 | `test_cjk_font.py` | 8 | 中文字体自动探测 |
 
 > 提示：GUI 测试使用 `QT_QPA_PLATFORM=offscreen`，可在无图形桌面环境运行。
@@ -300,19 +349,21 @@ scripts\build_exe.bat
 |------|------|:---:|
 | Python | 编程语言 | — |
 | PySide6 / Qt | 桌面 GUI 框架（QtCore/QtGui/QtWidgets） | ✅ |
-| 纯 Python 数学层（`llc_py.py`） | LLC FHA 计算 | ✅ |
-| QWidget + QPainter（`plot_widget.py`） | 绘图与渲染（无 Matplotlib） | ✅ |
+| 纯 Python 数学层（`llc_py.py` / `llc_design.py` / `llc_solver.py` / `llc_stress.py`） | FHA 计算 / 工程设计 / fn 求解 / 应力估算 | ✅ |
+| QWidget + QPainter（`plot_widget.py`） | 绘图与渲染 | ✅ |
 | NumPy | 旧矢量参考实现（`llc_model.py`）交叉测试 | ❌ 仅开发/测试 |
 | Matplotlib | 参考交叉测试 | ❌ 仅开发/测试 |
-| PyInstaller | 构建单文件 / onedir EXE | 构建期 |
+| PyInstaller | 构建单文件 EXE | 构建期 |
 | pytest | 自动化测试 | ❌ 仅开发/测试 |
 
 ## 17. 适用范围与局限性
 
-- 本工具基于 **FHA 基波近似**，适用于参数趋势分析和教学；
-- **不能替代** 开关级时域仿真；
-- **不能替代** 器件应力分析、ZVS 范围验证、磁件损耗计算与闭环稳定性验证；
-- 实际设计仍需结合仿真与硬件测试；
+本工具基于 **FHA 基波近似**，工程参数与电流/应力结果属于**前期设计估算**，适合
+参数趋势研究、方案比较与教学：
+
+- 来自 FHA 的工程参数、电流与应力结果**不能替代**开关级时域仿真；
+- **不能替代**器件级仿真（寄生参数、Coss、死区、磁件损耗、SR 换流等）与实际波形测试；
+- 实际产品设计仍需结合开关级仿真、磁件设计、损耗、ZVS 与热设计及样机波形进一步验证；
 - 当前发布目标为 Windows 10 / 11 64 位（其他显卡 / VM / RDP 环境以实际机器为准）。
 
 ## 18. 项目结构
@@ -323,13 +374,17 @@ LLC-Gain-Curve-Visualizer/
 │  ├─ main.py             PySide6 主窗口与交互逻辑
 │  ├─ plot_widget.py      QPainter 绘图层（三层缓存、Hover、图例）
 │  ├─ llc_py.py           纯 Python 数学层（增益、阻容边界、峰值）
+│  ├─ llc_design.py       工程设计（n / Re / Zr / Lr / Lm / Cr）
+│  ├─ llc_solver.py       fn 求解器（工作点 / 调频范围）
+│  ├─ llc_stress.py       FHA 电流/应力估算
+│  ├─ llc_report.py       结果/分析/建议文本生成
 │  ├─ llc_model.py        矢量参考数学模型（开发/交叉测试）
 │  ├─ llc_plot.py         旧 Matplotlib 参考绘图层（仅测试）
 │  └─ cjk_font.py         中文字体自动检测
-├─ tests/                 1015 项测试
-├─ scripts/               构建、测量、验收脚本
+├─ tests/                 1172 项测试（0 失败）
+├─ scripts/               构建、测量、验收、EXE 验证脚本
 ├─ docs/
-│  ├─ images/             最终界面截图
+│  ├─ images/             界面截图
 │  ├─ BUILD_AND_VALIDATION.md
 │  └─ release-notes-vX.Y.Z.md
 ├─ .github/workflows/     CI（Windows 3.10/3.11）

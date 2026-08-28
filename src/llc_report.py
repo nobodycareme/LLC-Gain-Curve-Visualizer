@@ -17,7 +17,6 @@ __all__ = [
     "build_suggestions",
     "compile_report",
     "format_key_results",
-    "format_detail_results",
     "format_short_analysis",
     "format_short_suggestions",
 ]
@@ -276,13 +275,12 @@ def compile_report(v: dict, e: dict, stress: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 右侧精简分层（需求 5.1）：默认只显示关键结果 + 精简分析/建议；
-# 详细辅助诊断移到可展开的"详细信息"区（默认折叠）。
+# 右侧精简分层（需求 5.1）：默认只显示关键结果 + 精简分析/建议。
 # ---------------------------------------------------------------------------
 
 def format_key_results(v: dict, e: dict | None = None,
                        s: dict | None = None) -> str:
-    """右侧默认【关键结果】精简区块：关键信息前置，辅助诊断移入详细信息。"""
+    """右侧默认【关键结果】精简区块：关键信息前置。"""
     lines = ["【关键结果】"]
     lines.append("当前：")
     lines.append("  K    = " + _fmt(v.get("K")))
@@ -292,19 +290,21 @@ def format_key_results(v: dict, e: dict | None = None,
     lines.append("  fs   = " + _fmt(v.get("fn", 1.0) * v.get("fr_khz", 0.0), 3)
                  + " kHz")
     if e:
-        lines.append("工程：")
+        lines.append("谐振腔参数：")
         lines.append("  n    = " + _fmt(e.get("n")))
+        lines.append("  Re   = " + _fmt(e.get("Re_full")) + " Ω")
         lines.append("  Lr   = " + _fmt(_h(e.get("Lr_calc")), 2, " µH"))
         lines.append("  Lm   = " + _fmt(_h(e.get("Lm_calc")), 2, " µH"))
         lines.append("  Cr   = " + _fmt(_n(e.get("Cr_calc")), 2, " nF"))
-        lines.append("  M_req_min = " + _fmt(e.get("M_req_min")))
-        lines.append("  M_req_max = " + _fmt(e.get("M_req_max")))
-        lines.append("  Q_full    = " + _fmt(e.get("Q_full")))
-        lines.append("  Q_overload= " + _fmt(e.get("Q_overload")))
-        lines.append("  fn_min    = " + _fmt(e.get("fn_min")))
-        lines.append("  fn_max    = " + _fmt(e.get("fn_max")))
-        lines.append("  fs_min    = " + _fmt(e.get("fs_min", 0.0), 3) + " kHz")
-        lines.append("  fs_max    = " + _fmt(e.get("fs_max", 0.0), 3) + " kHz")
+        lines.append("调频范围：")
+        lines.append("  所需最小增益 M_req_min = " + _fmt(e.get("M_req_min")))
+        lines.append("  所需最大增益 M_req_max = " + _fmt(e.get("M_req_max")))
+        lines.append("  满载 Q     Q_full    = " + _fmt(e.get("Q_full")))
+        lines.append("  过载 Q     Q_overload= " + _fmt(e.get("Q_overload")))
+        lines.append("  最低归一化频率 fn_min  = " + _fmt(e.get("fn_min")))
+        lines.append("  最高归一化频率 fn_max  = " + _fmt(e.get("fn_max")))
+        lines.append("  最低开关频率 fs_min    = " + _fmt(e.get("fs_min", 0.0), 3) + " kHz")
+        lines.append("  最高开关频率 fs_max    = " + _fmt(e.get("fs_max", 0.0), 3) + " kHz")
     if s:
         lines.append("最坏电流：")
         lines.append("  Ioe = " + _fmt(s.get("ioe_rms")) + " A")
@@ -318,27 +318,97 @@ def format_key_results(v: dict, e: dict | None = None,
     return "\n".join(lines)
 
 
-def format_detail_results(v: dict, e: dict | None = None,
-                          s: dict | None = None) -> str:
-    """详细信息（默认折叠）：参数定义 + 完整工作点/工程/应力 + 完整分析/建议。"""
-    parts = [
-        "【参数定义】",
-        "  K  = Lm / Lr",
-        "  fn = fs / fr",
-        "  Q  = sqrt(Lr/Cr) / Rac",
-        "",
-        "【当前工作点】", format_working_point(v),
-    ]
+def build_result_cards(v: dict, e: dict | None = None,
+                       s: dict | None = None,
+                       engine_ok: bool = False,
+                       engine_error: str | None = None) -> list:
+    """结构化结果卡片（需求 10 重排）：``[(标题, [行, ...]), ...]``。
+
+    每行是一个 tagged tuple：
+    * ``("kv", 名称, 值)``       —— label|value 网格（名称次级、值加粗）
+    * ``("flag", 标记, 消息)``   —— 设计分析（✓/⚠/✕ 着色）
+    * ``("bullet", 文本)``       —— 建议条目
+
+    固定顺序：当前工作点 → 谐振腔参数 → 调频范围 → 电流与应力
+    → 设计分析 → 建议。数学定义不在此重复计算（Re 等由设计层给出）。
+    与旧 ``build_result_sections`` 数据同源，是唯一数据来源。
+    """
+    sections = []
+    sections.append(("当前工作点", [
+        ("kv", "K", _fmt(v.get("K"))),
+        ("kv", "Q", _fmt(v.get("Q"))),
+        ("kv", "fn", _fmt(v.get("fn"))),
+        ("kv", "M(fn)", _fmt(v.get("Mfn"))),
+        ("kv", "fs", _fmt(v.get("fn", 1.0) * v.get("fr_khz", 0.0), 3) + " kHz"),
+    ]))
     if e:
-        parts += ["", "【工程设计结果】", format_design_results(e)]
+        # 谐振腔参数：含等效 AC 负载 Re = 8 n² Vo²/(π² Pout)（TI SLUP263 Eq.9）
+        sections.append(("谐振腔参数", [
+            ("kv", "拓扑 / 整流",
+             f"{'半桥' if e.get('bridge') == 'half' else '全桥'} / "
+             f"{_rect_label(e.get('rect'))}"),
+            ("kv", "n", _fmt(e.get("n"))),
+            ("kv", "等效交流负载 Re", _fmt(e.get("Re_full")) + " Ω"),
+            ("kv", "谐振电感 Lr", _fmt(_h(e.get("Lr_calc")), 2, " µH")),
+            ("kv", "励磁电感 Lm", _fmt(_h(e.get("Lm_calc")), 2, " µH")),
+            ("kv", "谐振电容 Cr", _fmt(_n(e.get("Cr_calc")), 2, " nF")),
+        ]))
+        sections.append(("调频范围", [
+            ("kv", "所需最小增益 M_req,min", _fmt(e.get("M_req_min"))),
+            ("kv", "所需最大增益 M_req,max", _fmt(e.get("M_req_max"))),
+            ("kv", "满载 Q  Q_full", _fmt(e.get("Q_full"))),
+            ("kv", "过载 Q  Q_overload", _fmt(e.get("Q_overload"))),
+            ("kv", "最低归一化频率 fn_min", _fmt(e.get("fn_min"))),
+            ("kv", "最高归一化频率 fn_max", _fmt(e.get("fn_max"))),
+            ("kv", "最低开关频率 fs_min", _fmt(e.get("fs_min", 0.0), 3) + " kHz"),
+            ("kv", "最高开关频率 fs_max", _fmt(e.get("fs_max", 0.0), 3) + " kHz"),
+        ]))
     if s:
-        parts += ["", "【电流与应力】", format_stress_results(s)]
-    if e:
-        parts += ["", "【分析】", "\n".join(
-            "  " + flag + " " + msg for flag, msg in build_analysis(e, s))]
-        parts += ["", "【建议】", "\n".join(
-            "  • " + x for x in build_suggestions(e))]
-    return "\n".join(parts)
+        cr = s.get("cr") or {}
+        rows = [
+            ("kv", "Ioe（原边折算）", _fmt(s.get("ioe_rms")) + " A"),
+            ("kv", "Im", _fmt(s.get("im_rms")) + " A"),
+            ("kv", "Ir", _fmt(s.get("ir_rms")) + " A"),
+        ]
+        if cr:
+            rows += [
+                ("kv", "Cr Irms", _fmt(cr.get("icr_rms")) + " A"),
+                ("kv", "Cr Vpeak", _fmt(cr.get("vcr_peak")) + " V"),
+            ]
+        sections.append(("电流与应力", rows))
+    if engine_ok and e:
+        items = build_analysis(e, s)
+        items = sorted(items, key=lambda it: _FLAG_ORDER.get(it[0], 9))[:6]
+        sections.append(("设计分析",
+                         [("flag", flag, msg) for flag, msg in items]))
+        sections.append(("建议",
+                         [("bullet", x) for x in build_suggestions(e)[:5]]))
+    elif engine_error:
+        sections.append(("设计分析", [("flag", "⚠", "工程参数无效：" + engine_error)]))
+    return sections
+
+
+def build_result_sections(v: dict, e: dict | None = None,
+                          s: dict | None = None,
+                          engine_ok: bool = False,
+                          engine_error: str | None = None) -> list:
+    """向下兼容的字符串卡片：``[(标题, [行文本, ...]), ...]``。
+
+    唯一数据来源是 :func:`build_result_cards`，这里仅把结构化行压平成与旧版
+    **逐字符一致**的文本（保持 ``toPlainText()`` 及既有断言不变）。
+    """
+    out = []
+    for title, rows in build_result_cards(v, e, s, engine_ok, engine_error):
+        lines = []
+        for row in rows:
+            if row[0] == "kv":          # ("kv", name, value)
+                lines.append(f"{row[1]:<16}  {row[2]}")
+            elif row[0] == "flag":      # ("flag", flag, msg)
+                lines.append(f"{row[1]}  {row[2]}")
+            else:                       # ("bullet", text)
+                lines.append(f"•  {row[1]}")
+        out.append((title, lines))
+    return out
 
 
 #: 分析项优先级：✕ > ⚠ > ✓（严重问题优先展示）
